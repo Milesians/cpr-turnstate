@@ -24,7 +24,7 @@ use gateway_plugin_sdk::{
     client::{AuthorError, ComposedPlugin, PluginBuilder, methods},
 };
 
-pub const PLUGIN_ID: &str = "ezou.account-probe";
+pub const PLUGIN_ID: &str = "milesians.cpr-turnstate";
 const MANIFEST: &[u8] = include_bytes!("../../plugin.json");
 
 /// 打包器和运行注册共用的作者清单

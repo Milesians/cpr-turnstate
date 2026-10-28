@@ -51,6 +51,14 @@ impl Method {
     }
 
     #[must_use]
+    pub const fn default_model(self) -> &'static str {
+        match self {
+            Self::Turnstate => "gpt-6-luna",
+            Self::Modeltrace => "gpt-6.1-sol",
+        }
+    }
+
+    #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Turnstate => "测票",
@@ -77,12 +85,34 @@ impl Default for MethodSchedule {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSchedule {
-    #[serde(default)]
+    #[serde(default = "turnstate_schedule")]
     pub turnstate: MethodSchedule,
-    #[serde(default)]
+    #[serde(default = "modeltrace_schedule")]
     pub modeltrace: MethodSchedule,
+}
+
+fn turnstate_schedule() -> MethodSchedule {
+    MethodSchedule {
+        model: Method::Turnstate.default_model().into(),
+        ..MethodSchedule::default()
+    }
+}
+fn modeltrace_schedule() -> MethodSchedule {
+    MethodSchedule {
+        model: Method::Modeltrace.default_model().into(),
+        ..MethodSchedule::default()
+    }
+}
+
+impl Default for AccountSchedule {
+    fn default() -> Self {
+        Self {
+            turnstate: turnstate_schedule(),
+            modeltrace: modeltrace_schedule(),
+        }
+    }
 }
 
 impl AccountSchedule {
@@ -106,6 +136,15 @@ impl AccountSchedule {
 pub struct Schedules {
     #[serde(default)]
     pub accounts: BTreeMap<String, AccountSchedule>,
+}
+
+/// 批量配置只修改显式提交的字段，未选中的方法和账号保持原值。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulePatch {
+    pub enabled: Option<bool>,
+    pub model: Option<String>,
+    pub interval_minutes: Option<u32>,
 }
 
 /// 记录状态
@@ -211,13 +250,22 @@ fn encode<T: Serialize>(value: &T) -> Result<Value, PluginFault> {
 /// # Errors
 /// 回调失败时返回错误
 pub async fn schedules(host: &HostClient) -> Result<(Schedules, Option<u64>), PluginFault> {
-    Ok(match host::state_get(host, SETTINGS, SCHEDULES).await? {
-        Some(record) => (
-            serde_json::from_value(record.value).unwrap_or_default(),
-            Some(record.version),
-        ),
-        None => (Schedules::default(), None),
-    })
+    let (mut schedules, version): (Schedules, _) =
+        match host::state_get(host, SETTINGS, SCHEDULES).await? {
+            Some(record) => (
+                serde_json::from_value(record.value).unwrap_or_default(),
+                Some(record.version),
+            ),
+            None => (Schedules::default(), None),
+        };
+    for account in schedules.accounts.values_mut() {
+        for method in Method::ALL {
+            if account.get(method).model.is_empty() {
+                account.get_mut(method).model = method.default_model().into();
+            }
+        }
+    }
+    Ok((schedules, version))
 }
 
 /// 改一个账号一种方法的设置；并发修改时重读再改
@@ -240,6 +288,46 @@ pub async fn update_schedule(
         }
         match host::state_put(host, SETTINGS, SCHEDULES, encode(&all)?, version).await {
             Ok(_) => return Ok(updated),
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "设置被同时修改，请重试",
+    ))
+}
+
+/// 同一次 CAS 写入所有选中账号，冲突时重读，避免部分账号被修改。
+///
+/// # Errors
+/// 私有状态操作失败或连续版本冲突时返回错误。
+pub async fn update_schedules(
+    host: &HostClient,
+    account_ids: &[String],
+    method: Method,
+    patch: &SchedulePatch,
+) -> Result<(), PluginFault> {
+    for _ in 0..5 {
+        let (mut all, version) = schedules(host).await?;
+        for id in account_ids {
+            let account = all.accounts.entry(id.clone()).or_default();
+            let schedule = account.get_mut(method);
+            if let Some(enabled) = patch.enabled {
+                schedule.enabled = enabled;
+            }
+            if let Some(model) = &patch.model {
+                schedule.model.clone_from(model);
+            }
+            if let Some(interval) = patch.interval_minutes {
+                schedule.interval_minutes = interval;
+            }
+            if *account == AccountSchedule::default() {
+                all.accounts.remove(id);
+            }
+        }
+        match host::state_put(host, SETTINGS, SCHEDULES, encode(&all)?, version).await {
+            Ok(_) => return Ok(()),
             Err(error) if error.code == ErrorCode::Conflict => {}
             Err(error) => return Err(error),
         }

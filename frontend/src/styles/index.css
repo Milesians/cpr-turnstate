@@ -90,3 +90,6 @@ body {
   .monitor-legend { padding: 14px; gap: 10px; }
   .legend-note { width: 100%; margin-left: 0; }
 }
+
+.monitor-selection { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 0 20px 14px; }
+@media (max-width: 720px) { .monitor-selection { padding-inline: 14px; gap: 10px; } .monitor-account { gap: 8px; } }

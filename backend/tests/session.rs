@@ -633,3 +633,112 @@ async fn overview_ranges_include_only_their_records_and_distinguish_empty_slots(
         );
     }
 }
+
+#[tokio::test]
+async fn defaults_are_method_specific_and_existing_models_are_preserved() {
+    let mut host = FakeHost::new(&["acct_a", "acct_b"]);
+    host.state.insert(("settings".into(),"schedules".into()),(json!({"accounts":{
+        "acct_b":{"turnstate":{"enabled":false,"model":"custom-ticket","interval_minutes":90},"modeltrace":{"enabled":false,"model":"","interval_minutes":120}}
+    }}),1));
+    let mut peer = Peer::start(json!({})).await;
+    let (_, body) = peer.api("GET", "api/overview", "", None, &mut host).await;
+    let a = &body["accounts"][0]["methods"];
+    assert_eq!(a["turnstate"]["schedule"]["model"], "gpt-6-luna");
+    assert_eq!(a["modeltrace"]["schedule"]["model"], "gpt-6.1-sol");
+    assert_eq!(a["turnstate"]["schedule"]["enabled"], false);
+    assert_eq!(a["modeltrace"]["schedule"]["enabled"], false);
+    let b = &body["accounts"][1]["methods"];
+    assert_eq!(b["turnstate"]["schedule"]["model"], "custom-ticket");
+    assert_eq!(b["turnstate"]["schedule"]["interval_minutes"], 90);
+    assert_eq!(b["modeltrace"]["schedule"]["model"], "gpt-6.1-sol");
+    assert_eq!(b["modeltrace"]["schedule"]["interval_minutes"], 120);
+    assert!(!host.calls.iter().any(|c| c == "host.state.put"
+        || c == "host.auth.get"
+        || c.starts_with("host.http.")
+        || c == "host.model.execute"));
+}
+
+#[tokio::test]
+async fn batch_configuration_changes_only_selected_fields_accounts_and_method() {
+    let mut host = FakeHost::new(&["acct_a", "acct_b", "acct_c"]);
+    host.state.insert(("settings".into(),"schedules".into()),(json!({"accounts":{
+        "acct_a":{"turnstate":{"enabled":false,"model":"ticket-a","interval_minutes":90},"modeltrace":{"enabled":true,"model":"trace-a","interval_minutes":120}},
+        "acct_b":{"turnstate":{"enabled":true,"model":"ticket-b","interval_minutes":180}},
+        "acct_c":{"turnstate":{"enabled":true,"model":"ticket-c","interval_minutes":240}}
+    }}),1));
+    let mut peer = Peer::start(json!({})).await;
+    let (status, body) = peer.api("POST","api/schedules/batch","",Some(json!({"account_ids":["acct_a","acct_b"],"method":"turnstate","interval_minutes":60})),&mut host).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["updated"], 2);
+    let state = host.get("settings", "schedules").unwrap();
+    assert_eq!(
+        state["accounts"]["acct_a"]["turnstate"],
+        json!({"enabled":false,"model":"ticket-a","interval_minutes":60})
+    );
+    assert_eq!(
+        state["accounts"]["acct_b"]["turnstate"],
+        json!({"enabled":true,"model":"ticket-b","interval_minutes":60})
+    );
+    assert_eq!(
+        state["accounts"]["acct_a"]["modeltrace"],
+        json!({"enabled":true,"model":"trace-a","interval_minutes":120})
+    );
+    assert_eq!(
+        state["accounts"]["acct_c"]["turnstate"]["interval_minutes"],
+        240
+    );
+    let (status, body) = peer.api("POST","api/schedules/batch","",Some(json!({"account_ids":["acct_a","acct_b"],"method":"turnstate","model":"gpt-6-luna","enabled":true})),&mut host).await;
+    assert_eq!(status, 200, "{body}");
+    let state = host.get("settings", "schedules").unwrap();
+    for id in ["acct_a", "acct_b"] {
+        assert_eq!(
+            state["accounts"][id]["turnstate"],
+            json!({"enabled":true,"model":"gpt-6-luna","interval_minutes":60})
+        );
+    }
+    assert!(
+        !host.calls.iter().any(|c| c == "host.auth.get"
+            || c.starts_with("host.http.")
+            || c == "host.model.execute")
+    );
+    assert_eq!(
+        host.calls
+            .iter()
+            .filter(|c| c.as_str() == "host.state.put")
+            .count(),
+        2,
+        "one state write for each batch"
+    );
+}
+
+#[tokio::test]
+async fn invalid_batch_configuration_changes_nothing() {
+    let mut host = FakeHost::new(&["acct_a", "acct_b"]);
+    host.accounts[1]["authentication_kind"] = json!("apikey");
+    let mut peer = Peer::start(json!({})).await;
+    for request in [
+        json!({"account_ids":[],"method":"turnstate","enabled":true}),
+        json!({"account_ids":vec!["acct_a";201],"method":"turnstate","enabled":true}),
+        json!({"account_ids":["acct_a","acct_a"],"method":"turnstate","enabled":true}),
+        json!({"account_ids":["acct_a"],"method":"turnstate"}),
+        json!({"account_ids":["acct_a"],"method":"turnstate","model":""}),
+        json!({"account_ids":["acct_a"],"method":"turnstate","model":"bad model"}),
+        json!({"account_ids":["acct_a"],"method":"turnstate","interval_minutes":0}),
+        json!({"account_ids":["acct_a"],"method":"turnstate","enabled":true,"unrecognized":true}),
+        json!({"account_ids":["acct_a","missing"],"method":"turnstate","enabled":true}),
+        json!({"account_ids":["acct_a","acct_b"],"method":"turnstate","enabled":true}),
+    ] {
+        let (status, body) = peer
+            .api(
+                "POST",
+                "api/schedules/batch",
+                "",
+                Some(request.clone()),
+                &mut host,
+            )
+            .await;
+        assert_eq!(status, 400, "{request}: {body}");
+        assert!(host.get("settings", "schedules").is_none());
+    }
+    assert!(!host.calls.iter().any(|c| c == "host.state.put"));
+}

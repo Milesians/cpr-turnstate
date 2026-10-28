@@ -3,20 +3,25 @@ import type { Blocker, Method, Models, Plan, Run } from '../api'
 import { ZButton, ZDialog, ZSegmented, ZSelect } from '@codex-proxy/ui'
 import { computed, ref, shallowRef, watch } from 'vue'
 import { api, ApiError, methodLabel, methods, runProbe } from '../api'
+import { probeModels } from '../probe-models'
 import RunView from './RunView.vue'
 
 const props = defineProps<{
   accountId: string
   accountName: string
   method: Method
-  model: string
+  savedModels: Record<Method, string>
   models: Models | null
 }>()
 const emit = defineEmits<{ done: [] }>()
 const open = defineModel<boolean>({ default: false })
 
 const method = ref<Method>(props.method)
-const model = ref(props.model)
+const choices = ref(probeModels(props.savedModels))
+const model = computed({
+  get: () => choices.value[method.value],
+  set: value => { choices.value[method.value] = value },
+})
 const plan = shallowRef<Plan | null>(null)
 const showRequest = ref(false)
 const running = ref(false)
@@ -45,7 +50,7 @@ const modelOptions = computed(() => {
 watch(open, (v) => {
   if (v) {
     method.value = props.method
-    model.value = props.model
+    choices.value = probeModels(props.savedModels)
     run.value = null
     error.value = ''
     blockers.value = []
@@ -54,15 +59,19 @@ watch(open, (v) => {
 })
 
 // 切换方法或模型只重新预览（不发送），不自动探测
+let previewId = 0
 watch([open, method, model], async () => {
+  const id = ++previewId
   plan.value = null
+  error.value = ''
   if (!open.value || !model.value)
     return
   try {
-    plan.value = await api.plan(props.accountId, method.value, model.value)
+    const result = await api.plan(props.accountId, method.value, model.value)
+    if (id === previewId) plan.value = result
   }
   catch (e) {
-    error.value = (e as Error).message
+    if (id === previewId) error.value = (e as Error).message
   }
 }, { immediate: true })
 

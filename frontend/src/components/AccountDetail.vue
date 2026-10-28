@@ -5,6 +5,7 @@ import { ArrowLeft } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { api, methodLabel, methods } from '../api'
 import { dateTime, levelTag, statusLabel } from '../format'
+import { defaultModels } from '../probe-models'
 import ProbeDialog from './ProbeDialog.vue'
 import RunView from './RunView.vue'
 
@@ -20,8 +21,8 @@ const dialogMethod = ref<Method>('turnstate')
 const openRun = shallowRef<Run | null>(null)
 const runOpen = ref(false)
 const drafts = ref<Record<Method, Schedule>>({
-  turnstate: { enabled: false, model: '', interval_minutes: 60 },
-  modeltrace: { enabled: false, model: '', interval_minutes: 60 },
+  turnstate: { enabled: false, model: defaultModels.turnstate, interval_minutes: 60 },
+  modeltrace: { enabled: false, model: defaultModels.modeltrace, interval_minutes: 60 },
 })
 
 async function load() {
@@ -156,7 +157,7 @@ onMounted(async () => {
         :account-id="accountId"
         :account-name="detail.account.name"
         :method="dialogMethod"
-        :model="drafts[dialogMethod].model"
+        :saved-models="{ turnstate: drafts.turnstate.model, modeltrace: drafts.modeltrace.model }"
         :models="models"
         @done="load"
       />

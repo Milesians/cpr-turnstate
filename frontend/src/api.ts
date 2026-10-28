@@ -36,6 +36,12 @@ export interface Schedule {
   interval_minutes: number
 }
 
+export interface SchedulePatch {
+  enabled?: boolean
+  model?: string
+  interval_minutes?: number
+}
+
 export interface LastAttempt {
   at_ms: number
   started: boolean
@@ -242,6 +248,7 @@ export const api = {
   probe: (account_id: string, method: Method, model: string) => call<{ run: Run }>('POST', 'api/probe', undefined, { account_id, method, model }),
   step: (run_id: string, account_id: string) => call<{ run: Run }>('POST', 'api/probe/step', undefined, { run_id, account_id }),
   schedule: (account_id: string, method: Method, s: Schedule) => call<{ schedule: unknown }>('POST', 'api/schedule', undefined, { account_id, method, ...s }),
+  batchSchedule: (account_ids: string[], method: Method, patch: SchedulePatch) => call<{ updated: number }>('POST', 'api/schedules/batch', undefined, { account_ids, method, ...patch }),
   syncBank: () => call<{ bank: BankInfo }>('POST', 'api/fingerprint/sync', undefined, {}),
 }
 

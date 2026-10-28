@@ -14,8 +14,9 @@ const dist = new URL('../frontend/dist/', import.meta.url)
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const fixture = `
 window.__requests = [];
-const method = () => ({schedule:{enabled:false,model:'gpt-6-astra',interval_minutes:60},last_attempt:null,latest:null,slots:Array.from({length:96},(_,i)=>({start_ms:Date.now()-(96-i)*900000,end_ms:Date.now()-(95-i)*900000,level:null,runs:[]})),rate:{judged:0,ok:0},rate_24h:{judged:0,ok:0},rate_7d:{judged:0,ok:0}});
+const method = () => ({schedule:{enabled:false,model:'gpt-6-astra',interval_minutes:60},last_attempt:null,latest:null,runs:[],slots:Array.from({length:96},(_,i)=>({start_ms:Date.now()-(96-i)*900000,end_ms:Date.now()-(95-i)*900000,level:null,runs:[]})),rate:{judged:0,ok:0},rate_24h:{judged:0,ok:0},rate_7d:{judged:0,ok:0}});
 const accounts = Array.from({length:40},(_,i)=>({id:'acct_'+i,name:'Account '+i,email:'test'+i+'@example.com',plan_type:'plus',enabled:true,credential_state:'ready',supported:true,token_expires_ms:null,running:null,methods:{turnstate:method(),modeltrace:method()}}));
+accounts[0].methods.turnstate.schedule.model='';accounts[0].methods.modeltrace.schedule.model='';
 const bank = {commit:'a'.repeat(40),source:'embedded',models:['gpt-6-astra'],checked_ms:0};
 window.codexProxyPlugin = {version:2,theme:'light',request:async request=>{
  window.__requests.push(request);
@@ -31,7 +32,13 @@ window.codexProxyPlugin = {version:2,theme:'light',request:async request=>{
    m.rate={judged:index%5===0||index%5===3?0:30,ok:index%5===2?27:30};
  }
 
+ if(request.path==='api/schedules/batch'){
+   const body=JSON.parse(request.body);
+   for(const id of body.account_ids){const account=accounts.find(a=>a.id===id);Object.assign(account.methods[body.method].schedule,Object.fromEntries(Object.entries(body).filter(([k])=>!['method','account_ids'].includes(k))));}
+   return {status:200,contentType:'application/json',body:new TextEncoder().encode(JSON.stringify({updated:body.account_ids.length})).buffer};
+ }
  const data = request.path === 'api/overview' ? {now_ms:Date.now(),range_hours:hours,config:{probe_enabled:false,min_interval_minutes:30,fingerprint_sync_hours:6},bank,accounts}
+ : request.path === 'api/account' ? {account:accounts.find(a=>a.id===new URLSearchParams(request.query).get('id')),config:{probe_enabled:false}}
  : request.path === 'api/models' ? {bank:[{id:'gpt-6-astra',display_name:'GPT',family:'GPT'}],cpr:['gpt-6-astra'],aliases:{}}
  : request.path === 'api/plan' ? {blockers:[],request:{headers:{'User-Agent':'CPR identity'},body:'request details '.repeat(200)}}
  : (()=>{throw Error('Unexpected request '+request.path)})();
@@ -116,6 +123,18 @@ try {
       assert(Math.abs(rect.center-viewportHeight/2)<3, `Dialog not centered: ${JSON.stringify(rect)}`)
       assert(!rect.overflow, 'Horizontal overflow')
       assert(!rect.started, 'Opening the dialog started a probe')
+      if(!last){
+        assert.equal(await evaluate("JSON.parse(window.__requests.filter(r=>r.path==='api/plan').at(-1).body).model",context),'gpt-6-luna','Ticket default model');
+        await evaluate("[...document.querySelectorAll('[role=dialog] [role=radio]')].find(e=>e.textContent.trim()==='ModelTrace').click()",context);
+        await sleep(200);
+        assert.equal(await evaluate("JSON.parse(window.__requests.filter(r=>r.path==='api/plan').at(-1).body).model",context),'gpt-6.1-sol','ModelTrace default on method switch');
+        await evaluate("[...document.querySelectorAll('[role=dialog] [role=radio]')].find(e=>e.textContent.trim()==='测票').click()",context);
+        await sleep(200);
+        assert.equal(await evaluate("JSON.parse(window.__requests.filter(r=>r.path==='api/plan').at(-1).body).model",context),'gpt-6-luna','Ticket choice retained on switch back');
+      } else {
+        assert.equal(await evaluate("JSON.parse(window.__requests.filter(r=>r.path==='api/plan').at(-1).body).model",context),'gpt-6-astra','Configured account model must remain selected');
+      }
+
       await evaluate(`(()=>{const panel=document.querySelector('[role="dialog"]');[...panel.querySelectorAll('button')].find(b=>b.textContent.trim()==='关闭').click()})()`,context)
       await sleep(250)
       console.log(`PASS ${width}x${height}, ${last?'last':'first'} account: dialog centered, visible, no probe sent`)
@@ -137,6 +156,24 @@ try {
       assert(await evaluate(`window.__requests.some(r=>r.path==='api/overview'&&new URLSearchParams(r.query).get('hours')==='${range}')`,context),'Time range was not requested');
     }
     console.log(`PASS ${width}x${height} time filters request complete 24h / 7d / 30d ranges`);
+    await evaluate("document.querySelector('#app').scrollTop=0;document.querySelector('[data-account=acct_0] input[type=checkbox]').click();document.querySelector('[data-account=acct_1] input[type=checkbox]').click();",context);
+    await sleep(100);
+    await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='批量配置').click()",context);
+    await sleep(200);
+    await evaluate("[...document.querySelectorAll('[role=dialog] [role=radio]')].find(e=>e.textContent.trim()==='开启').click()",context);
+    await evaluate("document.querySelector('[role=dialog] [role=combobox]').click()",context);
+    await sleep(200);
+    await evaluate("[...document.querySelectorAll('[role=option]')].find(e=>e.textContent.trim()==='gpt-6-luna').click()",context);
+    await evaluate("[...document.querySelectorAll('[role=dialog] button')].find(b=>b.textContent.includes('应用到 2 个账号')).click()",context);
+    await sleep(300);
+    const batch=await evaluate("JSON.parse(window.__requests.find(r=>r.path==='api/schedules/batch').body)",context);
+    assert.deepEqual(batch,{account_ids:['acct_0','acct_1'],method:'turnstate',enabled:true,model:'gpt-6-luna'});
+    assert(!await evaluate("window.__requests.some(r=>r.path==='api/probe')",context),'Configuration must never start a probe');
+    await evaluate("document.querySelector('[aria-label=\"配置 test0@example.com\"]').click()",context);
+    await sleep(300);
+    assert(await evaluate("document.body.textContent.includes('自动探测')&&document.querySelectorAll('[role=combobox]').length>=2",context),'Per-account configuration missing');
+    console.log(`PASS ${width}x${height} method defaults, per-account controls and batch model configuration, no probe sent`);
+
 
   }
   assert.equal(errors.length,0,JSON.stringify(errors))

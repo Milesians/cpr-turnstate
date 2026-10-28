@@ -49,6 +49,7 @@ pub fn registration() -> ManagementRegistration {
             route("POST", "api/probe"),
             route("POST", "api/probe/step"),
             route("POST", "api/schedule"),
+            route("POST", "api/schedules/batch"),
             route("POST", "api/fingerprint/sync"),
         ],
         resources: ["web/index.html", "web/app.js", "web/app.css"]
@@ -150,6 +151,7 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
         ("POST", "api/probe") => probe(app, host, decode(call)?).await,
         ("POST", "api/probe/step") => step(app, host, decode(call)?).await,
         ("POST", "api/schedule") => schedule(host, decode(call)?).await,
+        ("POST", "api/schedules/batch") => batch_schedule(host, decode(call)?).await,
         ("POST", "api/fingerprint/sync") => {
             app.runner.bank.sync(host).await;
             Ok(json!({"bank": app.runner.bank.current().info}))
@@ -618,4 +620,57 @@ async fn schedule(host: &HostClient, req: ScheduleRequest) -> Result<Value, ApiE
     )
     .await?;
     Ok(json!({"schedule": saved}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchScheduleRequest {
+    account_ids: Vec<String>,
+    method: Method,
+    enabled: Option<bool>,
+    model: Option<String>,
+    interval_minutes: Option<u32>,
+}
+
+async fn batch_schedule(host: &HostClient, req: BatchScheduleRequest) -> Result<Value, ApiError> {
+    if req.account_ids.is_empty() || req.account_ids.len() > 200 {
+        return Err(ApiError::invalid("每次请选择 1 到 200 个账号"));
+    }
+    let ids: std::collections::BTreeSet<_> = req.account_ids.iter().collect();
+    if ids.len() != req.account_ids.len() || ids.iter().any(|id| id.is_empty() || id.len() > 256) {
+        return Err(ApiError::invalid("账号列表无效或有重复"));
+    }
+    let patch = store::SchedulePatch {
+        enabled: req.enabled,
+        model: req.model,
+        interval_minutes: req.interval_minutes,
+    };
+    if patch.enabled.is_none() && patch.model.is_none() && patch.interval_minutes.is_none() {
+        return Err(ApiError::invalid("请至少选择一项要修改的配置"));
+    }
+    if patch
+        .model
+        .as_deref()
+        .is_some_and(|m| !crate::codex::valid_model(m))
+    {
+        return Err(ApiError::invalid("模型名无效"));
+    }
+    if patch
+        .interval_minutes
+        .is_some_and(|i| !(1..=10_080).contains(&i))
+    {
+        return Err(ApiError::invalid("间隔必须在 1 分钟到 7 天之间"));
+    }
+    let accounts = host::openai_accounts(host).await?;
+    if ids.iter().any(|id| {
+        !accounts
+            .iter()
+            .any(|a| &a.account_id == *id && supported(a))
+    }) {
+        return Err(ApiError::invalid(
+            "所选账号已不存在或不支持探测，请刷新列表",
+        ));
+    }
+    store::update_schedules(host, &req.account_ids, req.method, &patch).await?;
+    Ok(json!({"updated": req.account_ids.len()}))
 }
