@@ -27,7 +27,6 @@ use crate::verdict::Level;
 const JSON: &str = "application/json";
 const MAX_BODY: usize = 64 * 1024;
 const HOUR_MS: i64 = 3_600_000;
-const SLOTS: usize = 24;
 
 pub fn registration() -> ManagementRegistration {
     let route = |method: &str, path: &str| ManagementRoute {
@@ -132,7 +131,16 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
     let host = &call.host;
     let query = parse_query(&call.request.query);
     match (call.request.method.as_str(), call.request.path.as_str()) {
-        ("GET", "api/overview") => overview(app, host).await,
+        ("GET", "api/overview") => {
+            let hours = query
+                .get("hours")
+                .map_or(Ok(24), |v| v.parse::<i64>())
+                .map_err(|_| ApiError::invalid("时间范围无效"))?;
+            if ![24, 168, 720].contains(&hours) {
+                return Err(ApiError::invalid("时间范围只支持 24 小时、7 天或 30 天"));
+            }
+            overview(app, host, hours).await
+        }
         ("GET", "api/account") => account_detail(app, host, required(&query, "id")?).await,
         ("GET", "api/run") => {
             run_detail(host, required(&query, "id")?, required(&query, "account")?).await
@@ -262,6 +270,7 @@ struct SlotRun {
 #[derive(Serialize)]
 struct Slot {
     start_ms: i64,
+    end_ms: i64,
     /// 最严重的判定；探测了但都没判定（失败）是 unknown，没探测为空
     level: Option<Level>,
     runs: Vec<SlotRun>,
@@ -279,6 +288,7 @@ struct MethodView {
     last_attempt: Option<LastAttempt>,
     latest: Option<Summary>,
     slots: Vec<Slot>,
+    rate: Rate,
     rate_24h: Rate,
     rate_7d: Rate,
 }
@@ -307,22 +317,30 @@ fn rate(history: &[Summary], since: i64) -> Rate {
     r
 }
 
-fn slots(history: &[Summary], now: i64) -> Vec<Slot> {
-    let last = now - now.rem_euclid(HOUR_MS);
-    let first = last - (SLOTS as i64 - 1) * HOUR_MS;
-    let mut out: Vec<Slot> = (0..SLOTS as i64)
+fn slots(history: &[Summary], now: i64, hours: i64) -> Vec<Slot> {
+    // 固定基础精度；前端按可用宽度合并相邻格，保留完整的时间范围和记录。
+    let count = match hours {
+        168 => 84,
+        720 => 120,
+        _ => 96,
+    };
+    let end = now + 1;
+    let first = end - hours * HOUR_MS;
+    let step = hours * HOUR_MS / count;
+    let mut out: Vec<Slot> = (0..count)
         .map(|i| Slot {
-            start_ms: first + i * HOUR_MS,
+            start_ms: first + i * step,
+            end_ms: first + (i + 1) * step,
             level: None,
             runs: Vec::new(),
         })
         .collect();
     for s in history {
-        if s.started_ms < first || s.started_ms >= last + HOUR_MS {
+        if s.started_ms < first || s.started_ms >= end {
             continue;
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let slot = &mut out[((s.started_ms - first) / HOUR_MS) as usize];
+        let index = usize::try_from((s.started_ms - first) / step).unwrap_or_default();
+        let slot = &mut out[index];
         if let Some(level) = judged_level(s) {
             slot.level = Some(slot.level.map_or(level, |cur| cur.max(level)));
         }
@@ -339,7 +357,7 @@ fn slots(history: &[Summary], now: i64) -> Vec<Slot> {
     out
 }
 
-async fn overview(app: &App, host: &HostClient) -> Result<Value, ApiError> {
+async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, ApiError> {
     let accounts = host::openai_accounts(host).await?;
     let (schedules, _) = store::schedules(host).await?;
     let now = now_ms();
@@ -365,7 +383,8 @@ async fn overview(app: &App, host: &HostClient) -> Result<Value, ApiError> {
                     .rev()
                     .find(|s| s.status != Status::Running)
                     .cloned(),
-                slots: slots(&history, now),
+                slots: slots(&history, now, hours),
+                rate: rate(&history, now - hours * HOUR_MS),
                 rate_24h: rate(&history, now - 24 * HOUR_MS),
                 rate_7d: rate(&history, now - 7 * 24 * HOUR_MS),
             };
@@ -380,10 +399,10 @@ async fn overview(app: &App, host: &HostClient) -> Result<Value, ApiError> {
     }
     Ok(json!({
         "now_ms": now,
+        "range_hours": hours,
         "config": {
             "probe_enabled": app.runner.config.probe_enabled,
             "min_interval_minutes": app.runner.config.min_interval_minutes,
-            "codex_version": app.runner.config.codex_version,
             "fingerprint_sync_hours": app.runner.config.fingerprint_sync_hours,
         },
         "bank": app.runner.bank.current().info,
@@ -491,21 +510,27 @@ async fn plan(app: &App, host: &HostClient, req: ProbeRequest) -> Result<Value, 
     let account = supported_account(host, &req.account_id).await?;
     let blockers = app.runner.blockers(&account, req.method, &req.model);
     let request = match req.method {
-        Method::Turnstate => json!({
-            "path": "直连 Codex 后端，经账号在 CPR 绑定的代理（没绑就直连）；代理不可用时失败，不改为直连",
-            "method": "POST",
-            "url": crate::codex::ENDPOINT,
-            "headers": {
-                "Authorization": "Bearer ‹hidden›",
-                "Chatgpt-Account-Id": "‹hidden›",
-                "Originator": crate::codex::ORIGINATOR,
-                "Version": app.runner.config.codex_version,
-                "Session_id": "‹随机，同一次探测内不变›",
-                crate::codex::TURN_STATE_HEADER: "‹上一次响应里的票，第一次不带›",
-            },
-            "body": {"model": req.model, "input": crate::turnstate::ECHO_PROMPT, "reasoning_effort": "low", "stream": true, "store": false},
-            "count": format!("1 次拿票 + 最多 {} 次带回", crate::turnstate::ECHO_ATTEMPTS),
-        }),
+        Method::Turnstate => {
+            let identity = host::codex_identity(host).await.map_err(|_| {
+                ApiError::new(502, "host_identity", "读取 CPR 的 Codex 客户端身份失败")
+            })?;
+            json!({
+                "path": "直连 Codex 后端，经账号在 CPR 绑定的代理（没绑就直连）；代理不可用时失败，不改为直连",
+                "method": "POST",
+                "url": crate::codex::ENDPOINT,
+                "headers": {
+                    "Authorization": "Bearer ‹hidden›",
+                    "Chatgpt-Account-Id": "‹hidden›",
+                    "Originator": identity.originator,
+                    "User-Agent": identity.user_agent,
+                    "Version": identity.codex_version,
+                    "Session_id": "‹随机，同一次探测内不变›",
+                    crate::codex::TURN_STATE_HEADER: "‹上一次响应里的票，第一次不带›",
+                },
+                "body": {"model": req.model, "input": crate::turnstate::ECHO_PROMPT, "reasoning_effort": "low", "stream": true, "store": false},
+                "count": format!("1 次拿票 + 最多 {} 次带回", crate::turnstate::ECHO_ATTEMPTS),
+            })
+        }
         Method::Modeltrace => json!({
             "path": "经 CPR 自己的模型链（指定这个账号），用插件维护的 Key“账号探测（ModelTrace）”，计入它的用量",
             "body": {"model": req.model, "input": "‹一道“选 N 个 1 到 355 的整数”的题›", "store": false},

@@ -13,6 +13,25 @@ use gateway_plugin_sdk::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
+/// 读取 CPR 当前使用的 OpenAI 全局客户端身份，不发出上游请求。
+///
+/// # Errors
+/// 宿主服务失败或画像无效时失败，不回退到插件自行拼接的 UA。
+pub async fn codex_identity(
+    host: &HostClient,
+) -> Result<crate::codex::Identity, crate::verdict::UpstreamError> {
+    let profile = host
+        .service::<gateway_plugin_sdk::call::services::settings::PreviewClientProfile>((
+            "openai".into(),
+            None,
+        ))
+        .await
+        .map_err(|_| {
+            crate::verdict::UpstreamError::new("host", "读取 CPR 的 Codex 客户端身份失败")
+        })?;
+    crate::codex::Identity::from_profile(profile)
+}
+
 fn invalid_reply() -> PluginFault {
     PluginFault::new(ErrorCode::Fault, "宿主回调返回了无效响应")
 }

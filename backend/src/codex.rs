@@ -1,7 +1,7 @@
 //! 测票发给 ChatGPT Codex 后端的请求，以及流式响应的解析
 //!
-//! 请求复刻 sub2api 给 OpenAI OAuth 账号“测试连接”时发的那个：同样的请求头、同样的最小
-//! 请求体、同样的 Codex 身份；测票多带 `Session_id`、`X-Codex-Turn-State` 和
+//! 请求采用最小请求体，Codex 身份实时读取 CPR 的客户端画像；测票多带
+//! `Session_id`、`X-Codex-Turn-State` 和
 //! `reasoning.effort=low`。这里不刷新令牌、不写任何东西。
 
 use serde::Deserialize;
@@ -13,9 +13,6 @@ use crate::verdict::{UpstreamError, one_line};
 pub const TURN_STATE_HEADER: &str = "X-Codex-Turn-State";
 /// OAuth 账号发 Codex 请求的地址
 pub const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
-/// sub2api 自称的客户端：Codex 终端界面
-pub const ORIGINATOR: &str = "codex-tui";
-const USER_AGENT_SUFFIX: &str = " (Ubuntu 22.4.0; x86_64) xterm-256color";
 const ECHO_REASONING_EFFORT: &str = "low";
 
 /// 每个请求都要带的 Codex 基础提示词：openai/codex 的
@@ -32,6 +29,41 @@ const MAX_ERROR_BODY: usize = 4096;
 pub struct Credentials {
     pub access_token: String,
     pub chatgpt_account_id: String,
+}
+
+/// CPR 已解析的当前全局客户端画像，不在插件内拼接或缓存 UA。
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Identity {
+    pub user_agent: String,
+    pub originator: String,
+    pub codex_version: String,
+}
+
+impl Identity {
+    /// # Errors
+    /// 宿主画像缺失或包含不合法请求头时返回错误。
+    pub fn from_profile(profile: serde_json::Map<String, Value>) -> Result<Self, UpstreamError> {
+        let identity: Self = serde_json::from_value(Value::Object(profile))
+            .map_err(|_| UpstreamError::new("host", "CPR 没有返回有效的 Codex 客户端身份"))?;
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<(), UpstreamError> {
+        if [&self.user_agent, &self.originator, &self.codex_version]
+            .iter()
+            .any(|s| {
+                !header_safe(s) || s.len() > 4096 || !s.bytes().all(|b| (32..=126).contains(&b))
+            })
+        {
+            return Err(UpstreamError::new(
+                "host",
+                "CPR 的 Codex 客户端身份不能用于请求头",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// 校验模型名，避免把任意字符写进请求
@@ -59,12 +91,13 @@ pub type Headers = Vec<(String, Vec<u8>)>;
 /// 凭据、模型或票不能放进请求头时返回错误
 pub fn echo_request(
     credentials: &Credentials,
-    codex_version: &str,
+    identity: &Identity,
     model: &str,
     session_id: &str,
     turn_state: &str,
     cookie: &str,
 ) -> Result<(Headers, Vec<u8>), UpstreamError> {
+    identity.validate()?;
     if !valid_model(model) {
         return Err(UpstreamError::new("other", "模型名无效"));
     }
@@ -88,12 +121,18 @@ pub fn echo_request(
         ),
         ("Accept".to_owned(), b"text/event-stream".to_vec()),
         ("Openai-Beta".to_owned(), b"responses=experimental".to_vec()),
-        ("Originator".to_owned(), ORIGINATOR.as_bytes().to_vec()),
+        (
+            "Originator".to_owned(),
+            identity.originator.as_bytes().to_vec(),
+        ),
         (
             "User-Agent".to_owned(),
-            format!("{ORIGINATOR}/{codex_version}{USER_AGENT_SUFFIX}").into_bytes(),
+            identity.user_agent.as_bytes().to_vec(),
         ),
-        ("Version".to_owned(), codex_version.as_bytes().to_vec()),
+        (
+            "Version".to_owned(),
+            identity.codex_version.as_bytes().to_vec(),
+        ),
         (
             "Chatgpt-Account-Id".to_owned(),
             credentials.chatgpt_account_id.as_bytes().to_vec(),

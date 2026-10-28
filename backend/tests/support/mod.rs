@@ -3,13 +3,13 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
-use cpr_account_probe::{PLUGIN_ID, config::Config, manifest, plugin};
+use cpr_account_probe::{PLUGIN_ID, manifest, serve};
 use gateway_plugin_sdk::{
     CallContext, ErrorCode, Frame, Handshake, Message, PROTOCOL_VERSION, PluginFault,
     ResolvedCallBudgets, Stage,
     call::host::ModelEventBatch,
     call::model::{CanonicalEvent, ContentKind, ExecutionEvent, FinishReason, Usage},
-    client::{PluginSession, SessionConfig, read_frame, write_frame},
+    client::{read_frame, write_frame},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -53,6 +53,9 @@ pub struct FakeHost {
     pub models: VecDeque<Result<String, PluginFault>>,
     pub seen_models: Vec<(Value, Value)>,
     pub calls: Vec<String>,
+    pub profile: Option<Value>,
+    pub public_http: VecDeque<HttpReply>,
+    pub seen_public_http: Vec<Value>,
     streams: HashMap<String, Vec<u8>>,
     next_version: u64,
 }
@@ -209,6 +212,32 @@ impl FakeHost {
                     serde_json::to_vec(&json!({"added": 0, "removed": 0})).unwrap(),
                 ))
             }
+            "host.services.call" => {
+                assert_eq!(
+                    params,
+                    &json!({"operation":"settings.preview_client_profile","input":["openai",null]})
+                );
+                let profile = self.profile.clone().unwrap_or_else(|| {
+                    json!({
+                        "userAgent":"codex_exec/0.156.1 (Ubuntu 24.4.0; x86_64) xterm-256color",
+                        "originator":"codex_exec", "codexVersion":"0.156.1", "source":"global"
+                    })
+                });
+                Ok((json!({"Ok":profile}), Vec::new()))
+            }
+            "host.http.do_stream" => {
+                self.seen_public_http.push(params.clone());
+                assert!(payload.is_empty());
+                let Some(reply) = self.public_http.pop_front() else {
+                    return Err(PluginFault::new(ErrorCode::Upstream, "offline in tests"));
+                };
+                let id = format!("public-stream-{}", self.seen_public_http.len());
+                self.streams.insert(id.clone(), reply.body);
+                Ok((
+                    json!({"status":reply.status,"http_version":"HTTP/2.0","headers":reply.headers,"stream":id,"trailers":[]}),
+                    Vec::new(),
+                ))
+            }
             "host.http.account" => {
                 let reply = self
                     .http
@@ -235,7 +264,11 @@ impl FakeHost {
                     return Ok((json!({"eof": true}), Vec::new()));
                 }
                 // 小块交付，确认跨块拼接
-                let n = buf.len().min(max).min(40);
+                let n = buf.len().min(max).min(if id.starts_with("public-") {
+                    16 * 1024
+                } else {
+                    40
+                });
                 let chunk: Vec<u8> = buf.drain(..n).collect();
                 Ok((json!({"eof": false}), chunk))
             }
@@ -292,7 +325,6 @@ impl FakeHost {
                 Ok((json!({"models": ["gpt-6-astra", "gpt-6-luna"]}), Vec::new()))
             }
             "host.log" => Ok((json!({"recorded": true}), Vec::new())),
-            "host.http.do_stream" => Err(PluginFault::new(ErrorCode::Upstream, "offline in tests")),
             _ => panic!("unexpected host callback {method}"),
         }
     }
@@ -312,11 +344,7 @@ impl Peer {
         let (host, transport) = tokio::io::duplex(4 * 1024 * 1024);
         let (reader, writer) = tokio::io::split(transport);
         let task = tokio::spawn(async move {
-            let session = PluginSession::accept(reader, writer, SessionConfig::default())
-                .await
-                .unwrap();
-            let config = Config::from_handshake(&session.handshake().configuration);
-            session.run(plugin(config).unwrap()).await.unwrap();
+            serve(reader, writer).await.unwrap();
         });
         let (reader, writer) = tokio::io::split(host);
         let mut peer = Self {
@@ -357,6 +385,11 @@ impl Peer {
     ) -> Frame {
         self.next_id += 1;
         let id = self.next_id * 2 - 1;
+        let budget = self.budgets.budget(stage);
+        assert!(
+            budget <= Duration::from_secs(120),
+            "CPR HTTP rejects request limits above 120s: {budget:?}"
+        );
         self.send(Frame {
             message: Message::Call {
                 id,

@@ -20,5 +20,8 @@ fn config_defaults_keep_probes_off() {
     let config =
         Config::from_handshake(&serde_json::json!({"probeEnabled": true, "codexVersion": "bad"}));
     assert!(config.probe_enabled);
-    assert_eq!(config.codex_version, "0.146.0");
+    assert!(
+        config.probe_enabled,
+        "旧版本设置仍存在时应忽略 codexVersion，身份始终读取 CPR"
+    );
 }

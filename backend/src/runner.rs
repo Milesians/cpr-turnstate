@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
@@ -274,7 +274,7 @@ impl Runner {
             match method {
                 Method::Turnstate => {
                     let version = store::save(host, &run, None).await?;
-                    match self.turnstate(host, account, model).await {
+                    match within_budget(host, self.turnstate(host, account, model)).await {
                         Ok(result) => {
                             run.verdict = Some(turnstate::verdict(&result));
                             run.turnstate = Some(result);
@@ -336,7 +336,7 @@ impl Runner {
                 }
             }
         }
-        let outcome = self.step(host, &mut run).await;
+        let outcome = within_budget(host, self.step(host, &mut run)).await;
         if let Err(error) = outcome {
             finish(&mut run, Some(error));
         }
@@ -395,34 +395,6 @@ impl Runner {
             finish(run, None);
         }
         Ok(())
-    }
-
-    /// 自动探测：从发起到结束都在这一次调用里
-    ///
-    /// # Errors
-    /// 被拦截时返回拦截原因
-    pub async fn run_to_end(
-        &self,
-        host: &HostClient,
-        account: &AuthRuntimeAccount,
-        method: Method,
-        model: &str,
-    ) -> Result<Result<Run, Vec<Blocker>>, PluginFault> {
-        let mut run = match self
-            .start(host, account, method, model, Trigger::Auto)
-            .await?
-        {
-            Ok(run) => run,
-            Err(blockers) => return Ok(Err(blockers)),
-        };
-        while run.status == Status::Running {
-            let version = store::run(host, &run.id)
-                .await?
-                .map(|(_, v)| v)
-                .ok_or_else(|| PluginFault::new(ErrorCode::Fault, "探测记录丢失"))?;
-            run = self.advance(host, run, version).await?;
-        }
-        Ok(Ok(run))
     }
 
     /// 把中断的进行中记录标成失败
@@ -577,7 +549,7 @@ impl Runner {
                 access_token,
                 chatgpt_account_id,
             },
-            codex_version: self.config.codex_version.clone(),
+            identity: host::codex_identity(host).await?,
             session_id: codex::new_uuid().map_err(|e| UpstreamError::new("other", e))?,
             jar: CookieJar::default(),
         };
@@ -586,6 +558,20 @@ impl Runner {
 }
 
 use crate::host;
+
+/// 给结果落库留出时间，避免宿主结束 RPC 后记录还停在“进行中”。
+async fn within_budget<T>(
+    host: &HostClient,
+    future: impl std::future::Future<Output = Result<T, UpstreamError>>,
+) -> Result<T, UpstreamError> {
+    let budget = host
+        .remaining_budget()
+        .unwrap_or(Duration::from_secs(120))
+        .saturating_sub(Duration::from_secs(5));
+    tokio::time::timeout(budget, future)
+        .await
+        .unwrap_or_else(|_| Err(UpstreamError::new("timeout", "探测请求超时")))
+}
 
 fn finish(run: &mut Run, error: Option<UpstreamError>) {
     run.finished_ms = now_ms();
@@ -618,7 +604,7 @@ struct HostEcho<'a> {
     account_id: String,
     revision: u64,
     credentials: Credentials,
-    codex_version: String,
+    identity: codex::Identity,
     session_id: String,
     jar: CookieJar,
 }
@@ -628,7 +614,7 @@ impl EchoSession for HostEcho<'_> {
         let before = self.jar.route();
         let (headers, body) = codex::echo_request(
             &self.credentials,
-            &self.codex_version,
+            &self.identity,
             model,
             &self.session_id,
             state,

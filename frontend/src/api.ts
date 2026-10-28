@@ -66,6 +66,7 @@ export interface SlotRun {
 
 export interface Slot {
   start_ms: number
+  end_ms: number
   level: Level | null
   runs: SlotRun[]
 }
@@ -80,6 +81,7 @@ export interface MethodView {
   last_attempt: LastAttempt | null
   latest: Summary | null
   slots: Slot[]
+  rate: Rate
   rate_24h: Rate
   rate_7d: Rate
 }
@@ -112,12 +114,12 @@ export interface BankInfo {
 export interface Config {
   probe_enabled: boolean
   min_interval_minutes: number
-  codex_version: string
   fingerprint_sync_hours: number
 }
 
 export interface Overview {
   now_ms: number
+  range_hours: number
   config: Config
   bank: BankInfo
   accounts: OverviewAccount[]
@@ -232,7 +234,7 @@ async function call<T>(method: 'GET' | 'POST', path: string, query?: Record<stri
 }
 
 export const api = {
-  overview: () => call<Overview>('GET', 'api/overview'),
+  overview: (hours = 24) => call<Overview>('GET', 'api/overview', { hours: String(hours) }),
   account: (id: string) => call<AccountDetail>('GET', 'api/account', { id }),
   run: (id: string, account: string) => call<{ run: Run }>('GET', 'api/run', { id, account }),
   models: () => call<Models>('GET', 'api/models'),

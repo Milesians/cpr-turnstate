@@ -9,7 +9,7 @@
 | | 测票 | ModelTrace |
 | --- | --- | --- |
 | 做什么 | 先拿一张 `X-Codex-Turn-State` 票，再带回最新的票最多 3 次（KlN-4096/sub2api v0.2.17-klno.1 的回声判据） | 发 3 道“选 N 个 1 到 355 的整数”的题，按数字分布和 [ModelTrace](https://github.com/xqy2006/ModelTrace) 指纹库比对 |
-| 怎么发 | `host.http.account`：插件按当前凭据自己写请求，直连 `chatgpt.com/backend-api/codex/responses`，走账号在 CPR 绑定的代理（没绑就直连；绑了但不可用就失败，不回退直连）。请求复刻 sub2api“测试连接”，多 `Session_id`、`X-Codex-Turn-State` 和 `reasoning.effort=low`，一次测票内带上游下发的 cookie | `host.model.execute`：走 CPR 自己的模型链并指定这个账号，用插件自己维护的 Client Key“账号探测（ModelTrace）”（计入它的用量；分组“账号探测”的成员由插件维护） |
+| 怎么发 | `host.http.account`：插件按当前凭据自己写请求，直连 `chatgpt.com/backend-api/codex/responses`，走账号在 CPR 绑定的代理（没绑就直连；绑了但不可用就失败，不回退直连）。UA、Originator、Version 实时复用 CPR 全局客户端身份；多 `Session_id`、`X-Codex-Turn-State` 和 `reasoning.effort=low`，一次测票内带上游下发的 cookie | `host.model.execute`：走 CPR 自己的模型链并指定这个账号，用插件自己维护的 Client Key“账号探测（ModelTrace）”（计入它的用量；分组“账号探测”的成员由插件维护） |
 | 判定 | 第一次带回就被接受 → 正常；换过票后才被接受 → 疑似；每次都被换新票 → 降智；没发票、或负载均衡 cookie 变了 → 未判定 | 探测的模型概率 ≥ 50% 且最像它 → 正常；更像另一个模型且概率 ≥ 80%（至少 2 份有效回答）→ 降智；其余疑似；指纹库没有的模型 → 未判定。`gpt-6.1-sol` 按 `gpt-6-astra` 的指纹判定 |
 
 上游明确说自己过载（消息里有 overload）→ 疑似，计入状态条和正常率；其他失败（包括没有 overload 字样的 503）是探测失败、未判定。上游的模型名是它自己的说法，只记录、不参与判定。票是会话凭据，只存长度和 sha256 前 8 位。
@@ -28,6 +28,8 @@
 ## 自动探测、历史与指纹库
 
 - 宿主每轮维护（`plugin.reconcile`，每轮结束后约 30 秒）找到期的任务；忙碌的下一轮重试，被拦截的 10 分钟后重试；上游拒绝后不冷却
+- 列表以 Uptime Kuma 风格展示时间条，支持最近 24 小时、7 天、30 天；格子按可用宽度合并相邻时段，完整保留所选范围与全部记录。浅灰表示没有探测，深灰表示探测过但未判定或失败，蓝色表示进行中；它们都不计入正常率
+- 自动 ModelTrace：每轮维护答一道题，跨调用完成同一条记录，每道题前重新检查账号与安全闸。管理和维护使用 SDK 默认的 120 秒预算，兼容 CPR 受管 HTTP 的上限；请求超时前留出时间保存失败结果
 - 手动探测：测票在一次请求里做完；ModelTrace 由页面一题一题推进（CPR 管理请求 180 秒超时）。页面关掉或插件重启时，超过 20 分钟没完成的记录标成“中断”
 - 历史存在插件私有状态：每个账号每种方法保留 30 天摘要（状态条、正常率），详情只留最近 50 条（单条私有状态最大 256 KiB、每个命名空间 16 MiB）
 - 指纹库内置一份（`backend/data/unified_bank.json`），按“指纹库同步间隔”（默认 6 小时，0 关闭）从 GitHub 同步 `xqy2006/ModelTrace` 的 `static/data/unified_bank.json`；页面上可以立即同步。新库校验不过就继续用手上的那份并显示原因。指纹库只放内存，插件重启后先用内置的
@@ -39,6 +41,8 @@
 ```bash
 pnpm --dir frontend install --frozen-lockfile
 pnpm --dir frontend build
+pnpm --dir frontend test
+CHROME_BIN=/path/to/chrome node scripts/check-ui.mjs
 cargo test --manifest-path backend/Cargo.toml
 ```
 

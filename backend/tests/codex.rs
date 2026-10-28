@@ -1,5 +1,5 @@
 use cpr_account_probe::codex::{
-    self, CookieJar, Credentials, INSTRUCTIONS, StreamReader, TURN_STATE_HEADER,
+    self, CookieJar, Credentials, INSTRUCTIONS, Identity, StreamReader, TURN_STATE_HEADER,
 };
 use sha2::{Digest, Sha256};
 
@@ -7,6 +7,14 @@ fn creds() -> Credentials {
     Credentials {
         access_token: "tok-secret-123".into(),
         chatgpt_account_id: "acct-0000-1111".into(),
+    }
+}
+
+fn identity() -> Identity {
+    Identity {
+        user_agent: "codex_exec/0.156.1 (Ubuntu 24.4.0; x86_64) xterm-256color".into(),
+        originator: "codex_exec".into(),
+        codex_version: "0.156.1".into(),
     }
 }
 
@@ -44,7 +52,7 @@ fn instructions_are_the_official_codex_prompt() {
 fn echo_request_is_the_connection_test_plus_the_ticket() {
     let (headers, body) = codex::echo_request(
         &creds(),
-        "0.146.0",
+        &identity(),
         "gpt-6-astra",
         "sess-1",
         "ticket-1",
@@ -59,12 +67,9 @@ fn echo_request_is_the_connection_test_plus_the_ticket() {
     };
     assert_eq!(get("Authorization").unwrap(), "Bearer tok-secret-123");
     assert_eq!(get("Chatgpt-Account-Id").unwrap(), "acct-0000-1111");
-    assert_eq!(get("Originator").unwrap(), "codex-tui");
-    assert_eq!(get("Version").unwrap(), "0.146.0");
-    assert_eq!(
-        get("User-Agent").unwrap(),
-        "codex-tui/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
-    );
+    assert_eq!(get("Originator").unwrap(), "codex_exec");
+    assert_eq!(get("Version").unwrap(), "0.156.1");
+    assert_eq!(get("User-Agent").unwrap(), identity().user_agent);
     assert_eq!(get("Openai-Beta").unwrap(), "responses=experimental");
     assert_eq!(get("Session_id").unwrap(), "sess-1");
     assert_eq!(get(TURN_STATE_HEADER).unwrap(), "ticket-1");
@@ -97,7 +102,7 @@ fn echo_request_is_the_connection_test_plus_the_ticket() {
 
 #[test]
 fn the_first_shot_carries_no_ticket_and_no_cookie() {
-    let (headers, _) = codex::echo_request(&creds(), "0.146.0", "m", "s", "", "").unwrap();
+    let (headers, _) = codex::echo_request(&creds(), &identity(), "m", "s", "", "").unwrap();
     assert!(
         headers
             .iter()
@@ -107,11 +112,11 @@ fn the_first_shot_carries_no_ticket_and_no_cookie() {
 
 #[test]
 fn echo_request_rejects_bad_input() {
-    assert!(codex::echo_request(&creds(), "0.146.0", "bad model", "s", "", "").is_err());
+    assert!(codex::echo_request(&creds(), &identity(), "bad model", "s", "", "").is_err());
     let mut c = creds();
     c.access_token = "a\r\nb".into();
-    assert!(codex::echo_request(&c, "0.146.0", "m", "s", "", "").is_err());
-    assert!(codex::echo_request(&creds(), "0.146.0", "m", "s", "t\n", "").is_err());
+    assert!(codex::echo_request(&c, &identity(), "m", "s", "", "").is_err());
+    assert!(codex::echo_request(&creds(), &identity(), "m", "s", "t\n", "").is_err());
 }
 
 #[test]

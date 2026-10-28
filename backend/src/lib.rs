@@ -10,11 +10,14 @@ mod management;
 pub mod modeltrace;
 mod runner;
 mod scheduler;
+mod session;
 pub mod store;
 pub mod turnstate;
 pub mod verdict;
 
 use std::sync::Arc;
+
+pub use session::serve;
 
 use gateway_plugin_sdk::{
     Manifest, ManifestError,
