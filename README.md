@@ -51,7 +51,9 @@ cargo install --locked --git https://github.com/zyycn/codex-proxy-rs.git --rev 4
 bash scripts/package            # 默认本机平台；也可传 aarch64-unknown-linux-gnu 等
 ```
 
-在 CPR 的“插件管理”上传 `dist/` 里的 `.tar.gz`，确认完整信任后安装。插件以 CPR 的系统身份运行（能读账号凭据），CPR 不提供沙箱。
+在 CPR 的“插件管理”点安装，来源选 **GitHub**，填 `Milesians/cpr-turnstate`（标签留空取最新稳定版），按 CPR 服务器的平台选 `x86_64` 或 `aarch64` 的包，确认完整信任后安装；以后可以在插件详情里检查更新。也可以上传本地 `dist/` 里的 `.tar.gz`。
+
+发布新版本：改 `plugin.json` 的 `version` 和 `release/notes.md`，推送 `v<版本>` 标签，GitHub Actions 检查通过后构建 Linux x86_64 / aarch64 两个安装包，连同 `.sha256` 和 `checksums.txt` 发布为 Release。插件以 CPR 的系统身份运行（能读账号凭据），CPR 不提供沙箱。
 
 ## 许可
 
