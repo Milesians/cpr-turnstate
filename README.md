@@ -1,0 +1,58 @@
+# 账号探测（CPR 插件）
+
+[Codex Proxy RS](https://github.com/zyycn/codex-proxy-rs)（CPR）的插件：主动探测 CPR 里的 OpenAI OAuth 账号有没有被降智。页面在 CPR 的“插件”导航里打开，不需要另外部署前端。
+
+插件 ID `ezou.account-probe`，要求 CPR `>=3.34.0, <4.0.0`（清单 v2、RPC v7、`management` v2、`maintenance` v1）。SDK 和打包 CLI 都固定在 CPR 的 `v3.34.0`（`47d30474af7c3e1fab433f2d4a70430fae548ff2`）。
+
+## 两种探测
+
+| | 测票 | ModelTrace |
+| --- | --- | --- |
+| 做什么 | 先拿一张 `X-Codex-Turn-State` 票，再带回最新的票最多 3 次（KlN-4096/sub2api v0.2.17-klno.1 的回声判据） | 发 3 道“选 N 个 1 到 355 的整数”的题，按数字分布和 [ModelTrace](https://github.com/xqy2006/ModelTrace) 指纹库比对 |
+| 怎么发 | `host.http.account`：插件按当前凭据自己写请求，直连 `chatgpt.com/backend-api/codex/responses`，走账号在 CPR 绑定的代理（没绑就直连；绑了但不可用就失败，不回退直连）。请求复刻 sub2api“测试连接”，多 `Session_id`、`X-Codex-Turn-State` 和 `reasoning.effort=low`，一次测票内带上游下发的 cookie | `host.model.execute`：走 CPR 自己的模型链并指定这个账号，用插件自己维护的 Client Key“账号探测（ModelTrace）”（计入它的用量；分组“账号探测”的成员由插件维护） |
+| 判定 | 第一次带回就被接受 → 正常；换过票后才被接受 → 疑似；每次都被换新票 → 降智；没发票、或负载均衡 cookie 变了 → 未判定 | 探测的模型概率 ≥ 50% 且最像它 → 正常；更像另一个模型且概率 ≥ 80%（至少 2 份有效回答）→ 降智；其余疑似；指纹库没有的模型 → 未判定。`gpt-6.1-sol` 按 `gpt-6-astra` 的指纹判定 |
+
+上游明确说自己过载（消息里有 overload）→ 疑似，计入状态条和正常率；其他失败（包括没有 overload 字样的 503）是探测失败、未判定。上游的模型名是它自己的说法，只记录、不参与判定。票是会话凭据，只存长度和 sha256 前 8 位。
+
+## 安全闸
+
+手动和自动探测走同一套（`backend/src/runner.rs`）：
+
+- 插件设置“发出真实探测”默认关闭，关闭时什么也发不出去
+- 只探测启用中的 OpenAI OAuth 账号；凭据状态是 expired/banned/invalid 的不探测
+- **不刷新令牌**：访问令牌已过期或 30 秒内过期就拦截，等 CPR 自己刷新
+- 同账号串行，全局最多 8 个并发
+- 自动探测同账号同方法间隔不小于“最短间隔”（默认 30 分钟）；手动不受它限制
+- 遇到上游拒绝就停止这次探测的后续请求；不改 CPR 里的账号状态
+
+## 自动探测、历史与指纹库
+
+- 宿主每轮维护（`plugin.reconcile`，每轮结束后约 30 秒）找到期的任务；忙碌的下一轮重试，被拦截的 10 分钟后重试；上游拒绝后不冷却
+- 手动探测：测票在一次请求里做完；ModelTrace 由页面一题一题推进（CPR 管理请求 180 秒超时）。页面关掉或插件重启时，超过 20 分钟没完成的记录标成“中断”
+- 历史存在插件私有状态：每个账号每种方法保留 30 天摘要（状态条、正常率），详情只留最近 50 条（单条私有状态最大 256 KiB、每个命名空间 16 MiB）
+- 指纹库内置一份（`backend/data/unified_bank.json`），按“指纹库同步间隔”（默认 6 小时，0 关闭）从 GitHub 同步 `xqy2006/ModelTrace` 的 `static/data/unified_bank.json`；页面上可以立即同步。新库校验不过就继续用手上的那份并显示原因。指纹库只放内存，插件重启后先用内置的
+
+## 开发
+
+需要 Rust 1.99.1、Node.js 24、pnpm 12.6。
+
+```bash
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend build
+cargo test --manifest-path backend/Cargo.toml
+```
+
+`backend/tests/fingerprint.rs` 用 ModelTrace JS 实现生成的黄金向量逐项对拍 Rust 移植。
+
+## 打包与安装
+
+```bash
+cargo install --locked --git https://github.com/zyycn/codex-proxy-rs.git --rev 47d30474af7c3e1fab433f2d4a70430fae548ff2 codex-proxy-plugin-cli --root .tools
+bash scripts/package            # 默认本机平台；也可传 aarch64-unknown-linux-gnu 等
+```
+
+在 CPR 的“插件管理”上传 `dist/` 里的 `.tar.gz`，确认完整信任后安装。插件以 CPR 的系统身份运行（能读账号凭据），CPR 不提供沙箱。
+
+## 许可
+
+MIT。ModelTrace 指纹算法与指纹库来自 xqy2006/ModelTrace（MIT），Codex 提示词来自 openai/codex（Apache-2.0），协议见 `backend/data/`。

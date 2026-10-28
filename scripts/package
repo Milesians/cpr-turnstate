@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# 构建前后端并打成 CPR 插件安装包（dist/*.tar.gz + .sha256）
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+target="${1:-$(~/.cargo/bin/rustc -vV 2>/dev/null | awk '/^host: / {print $2}' || rustc -vV | awk '/^host: / {print $2}')}"
+plugin_cli="${PLUGIN_CLI:-$PWD/.tools/bin/cpr-plugin}"
+cargo="${CARGO:-$(command -v cargo || echo ~/.cargo/bin/cargo)}"
+if [ ! -x "$plugin_cli" ]; then
+  echo "没有找到插件 CLI：按 README 安装，或用 PLUGIN_CLI 指定" >&2
+  exit 1
+fi
+case "$target" in
+  x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin) ;;
+  *) echo "不支持的目标平台：$target" >&2; exit 1 ;;
+esac
+
+pnpm --dir frontend build
+"$cargo" build --release --locked --target "$target" --manifest-path backend/Cargo.toml
+"$plugin_cli" package \
+  --manifest plugin.json \
+  --binary "backend/target/$target/release/cpr-account-probe" \
+  --target "$target" \
+  --resource-map web=frontend/dist \
+  --output-dir dist
