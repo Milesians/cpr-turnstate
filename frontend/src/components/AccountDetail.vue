@@ -4,7 +4,7 @@ import { ZButton, ZCard, ZDialog, ZEmpty, ZInputNumber, ZSelect, ZSwitch, ZTag }
 import { ArrowLeft } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { api, methodLabel, methods } from '../api'
-import { dateTime, levelTag, statusLabel } from '../format'
+import { dateTime, levelLabel, levelTag, statusLabel } from '../format'
 import { defaultModels } from '../probe-models'
 import ProbeDialog from './ProbeDialog.vue'
 import RunView from './RunView.vue'
@@ -120,6 +120,15 @@ onMounted(async () => {
           </ZButton>
         </template>
         <div class="flex flex-col gap-3 text-cp-sm">
+          <div v-if="detail.account.methods[m].health" class="flex flex-wrap items-center gap-2" aria-live="polite">
+            <span>当前判定</span>
+            <ZTag :type="levelTag(detail.account.methods[m].health!.level)">{{ levelLabel[detail.account.methods[m].health!.level] }}</ZTag>
+            <span class="text-cp-xs text-cp-text-secondary">连续 3 次正常才恢复；连续 3 次降智或疑似才转异常</span>
+            <span v-if="detail.account.methods[m].health!.streak" class="text-cp-xs text-cp-text-secondary">本轮{{ detail.account.methods[m].health!.candidate === 'ok' ? '正常' : '异常' }} {{ detail.account.methods[m].health!.streak }}/3</span>
+            <span v-if="detail.account.methods[m].health!.notification_pending" class="text-cp-xs text-cp-text-secondary">TG 待发送 {{ detail.account.methods[m].health!.notification_pending }} 条</span>
+            <span v-if="detail.account.methods[m].health!.notification_error" class="w-full text-cp-xs text-cp-warning-text">{{ detail.account.methods[m].health!.notification_error }}</span>
+            <span v-if="detail.account.methods[m].health!.notifications_dropped" class="w-full text-cp-xs text-cp-warning-text">通知长期未送达，已丢弃 {{ detail.account.methods[m].health!.notifications_dropped }} 条最旧通知</span>
+          </div>
           <div class="flex flex-wrap items-center gap-3">
             <ZSwitch v-model="drafts[m].enabled" label="自动探测" :disabled="saving === m" @change="save(m)" />
             <ZSelect v-model="drafts[m].model" :options="modelOptions" filterable placeholder="模型" class="w-56" :disabled="saving === m" @change="save(m)" />

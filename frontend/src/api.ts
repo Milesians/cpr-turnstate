@@ -86,10 +86,23 @@ export interface MethodView {
   schedule: Schedule
   last_attempt: LastAttempt | null
   latest: Summary | null
+  health?: Health | null
   slots: Slot[]
   rate: Rate
   rate_24h: Rate
   rate_7d: Rate
+}
+
+export interface Health {
+  level: Level
+  model: string
+  candidate: Level | null
+  streak: number
+  changed_ms: number
+  last_run_id: string
+  notification_pending: number
+  notification_error: string | null
+  notifications_dropped: number
 }
 
 export interface Account {
@@ -121,6 +134,8 @@ export interface Config {
   probe_enabled: boolean
   min_interval_minutes: number
   fingerprint_sync_hours: number
+  telegram_enabled: boolean
+  telegram_configured: boolean
 }
 
 export interface Overview {
@@ -133,7 +148,7 @@ export interface Overview {
 
 export interface AccountDetail {
   account: Account & {
-    methods: Record<Method, { schedule: Schedule, last_attempt: LastAttempt | null, runs: Summary[] }>
+    methods: Record<Method, { schedule: Schedule, last_attempt: LastAttempt | null, runs: Summary[], health?: Health | null }>
   }
   config: { probe_enabled: boolean }
 }
@@ -250,6 +265,7 @@ export const api = {
   schedule: (account_id: string, method: Method, s: Schedule) => call<{ schedule: unknown }>('POST', 'api/schedule', undefined, { account_id, method, ...s }),
   batchSchedule: (account_ids: string[], method: Method, patch: SchedulePatch) => call<{ updated: number }>('POST', 'api/schedules/batch', undefined, { account_ids, method, ...patch }),
   syncBank: () => call<{ bank: BankInfo }>('POST', 'api/fingerprint/sync', undefined, {}),
+  testTelegram: () => call<{ sent: boolean }>('POST', 'api/telegram/test', undefined, {}),
 }
 
 /** 发起一次探测；ModelTrace 由页面逐题推进，直到完成 */

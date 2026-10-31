@@ -3,7 +3,7 @@
   "name": "cpr-turnstate",
   "displayName": "账号探测",
   "publisher": "milesians",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "ModelTrace 指纹与测票：主动探测 OpenAI OAuth 账号是否被降智",
   "license": "MIT",
   "author": "Milesians",
@@ -42,6 +42,33 @@
         "minimum": 0,
         "maximum": 720,
         "default": 6
+      },
+      "telegramEnabled": {
+        "type": "boolean",
+        "title": "TG 状态通知",
+        "description": "测票连续 3 次确认状态变化后通知；发送失败会重试，不影响探测结果",
+        "default": false
+      },
+      "telegramBotToken": {
+        "type": "string",
+        "title": "TG Bot Token（敏感字段）",
+        "description": "从 BotFather 获取，通过 CPR 独立敏感配置保存，不要填入普通配置",
+        "maxLength": 256
+      },
+      "telegramChatId": {
+        "type": "string",
+        "title": "TG Chat ID",
+        "description": "接收通知的用户、群组 ID 或 @频道名；私聊需先向机器人发送 /start",
+        "maxLength": 128,
+        "default": ""
+      },
+      "telegramThreadId": {
+        "type": "integer",
+        "title": "TG 话题 ID",
+        "description": "发送到群组话题时填写，0 表示不指定话题",
+        "minimum": 0,
+        "maximum": 2147483647,
+        "default": 0
       }
     },
     "patternProperties": {
@@ -53,6 +80,7 @@
     },
     "additionalProperties": false
   },
+  "secretFields": ["telegramBotToken"],
   "resources": {
     "web/index.html": "text/html",
     "web/app.js": "text/javascript",

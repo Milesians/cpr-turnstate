@@ -17,6 +17,7 @@ const models = shallowRef<Models | null>(null)
 const loading = ref(false)
 const error = ref('')
 const syncing = ref(false)
+const testingTelegram = ref(false)
 const selected = ref<{ id: string, run?: string } | null>(null)
 const dialog = ref(false)
 const dialogAccount = shallowRef<OverviewAccount | null>(null)
@@ -88,6 +89,16 @@ async function syncBank() {
   catch (e) { error.value = (e as Error).message }
   finally { syncing.value = false }
 }
+async function testTelegram() {
+  testingTelegram.value = true
+  error.value = ''
+  try {
+    await api.testTelegram()
+    notice.value = 'TG 测试通知已发送'
+  }
+  catch (e) { error.value = (e as Error).message }
+  finally { testingTelegram.value = false }
+}
 function probe(account: OverviewAccount) {
   dialogAccount.value = account
   dialog.value = true
@@ -121,7 +132,7 @@ onMounted(() => Promise.all([load(), loadModels()]))
           </div>
         </header>
 
-        <section class="monitor-summary" aria-label="所选时间段的账号状态">
+        <section class="monitor-summary" aria-label="账号当前判定">
           <div v-for="item in totals" :key="item.state" class="summary-item">
             <span class="state-dot" :data-state="item.state" />
             <span class="text-cp-xs text-cp-text-secondary">{{ item.label }}</span>
@@ -173,11 +184,13 @@ onMounted(() => Promise.all([load(), loadModels()]))
           </article>
           <footer class="monitor-legend">
             <span v-for="s in (['ok', 'suspect', 'degraded', 'unknown', 'empty', 'running'] as const)" :key="s" class="inline-flex items-center gap-1.5"><i class="legend-cell" :data-state="s" />{{ stateLabel[s] }}</span>
-            <span class="legend-note">空白与未判定不计入正常率 · 悬停或点按查看记录</span>
+            <span class="legend-note">当前测票判定需连续 3 次确认 · 时间条与正常率保留单次原始结果</span>
           </footer>
         </section>
 
         <footer class="monitor-footer">
+          <span>TG 通知{{ overview?.config.telegram_enabled ? overview.config.telegram_configured ? '已开启' : '配置不完整' : '未开启' }} · 在 CPR 插件详情的设置与敏感配置中配置</span>
+          <button type="button" class="sync-link" :disabled="testingTelegram || !overview?.config.telegram_configured" @click="testTelegram">{{ testingTelegram ? '发送中…' : '发送 TG 测试通知' }}</button>
           <span v-if="overview">指纹库 {{ overview.bank.commit.slice(0, 10) }} · {{ overview.bank.models.length }} 个模型<span v-if="overview.bank.checked_ms"> · {{ dateTime(overview.bank.checked_ms) }} 检查</span></span>
           <button type="button" class="sync-link" :disabled="syncing" @click="syncBank"><RefreshCw :size="12" :class="{ 'animate-spin': syncing }" aria-hidden="true" />{{ syncing ? '同步中…' : '同步指纹库' }}</button>
           <span v-if="overview?.bank.error" class="w-full text-cp-warning-text">{{ overview.bank.error }}</span>

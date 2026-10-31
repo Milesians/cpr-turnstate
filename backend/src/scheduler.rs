@@ -80,6 +80,15 @@ impl Scheduler {
             .sync_if_due(host, runner.config.fingerprint_sync_hours)
             .await;
         let accounts = host::openai_accounts(host).await?;
+        let mut delivered = 0;
+        for account in &accounts {
+            if crate::telegram::dispatch(host, &runner.config, account).await {
+                delivered += 1;
+            }
+            if delivered >= 8 || host.remaining_budget().is_some_and(|b| b.as_secs() < 15) {
+                break;
+            }
+        }
         if let Err(error) = runner.sync_members(host, &accounts).await {
             host::log(
                 host,

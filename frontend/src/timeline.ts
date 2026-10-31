@@ -29,6 +29,14 @@ export function fitSlots(slots: Slot[], width: number): Slot[] {
 export function accountState(account: OverviewAccount): CellState {
   if (account.running)
     return 'running'
+  const health = account.methods.turnstate.health
+  if (health?.last_run_id)
+    return health.level
+  // Current verdicts must not depend on the selected historical time range.
+  if (health) {
+    const latest = account.methods.modeltrace.latest
+    return latest ? latest.status === 'done' ? latest.level ?? 'unknown' : 'unknown' : 'empty'
+  }
   const slots = Object.values(account.methods).flatMap(m => m.slots)
   const states = slots.map(cellState).filter(s => s !== 'empty' && s !== 'running') as Level[]
   if (states.length)

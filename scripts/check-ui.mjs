@@ -17,6 +17,7 @@ window.__requests = [];
 const method = () => ({schedule:{enabled:false,model:'gpt-6-astra',interval_minutes:60},last_attempt:null,latest:null,runs:[],slots:Array.from({length:96},(_,i)=>({start_ms:Date.now()-(96-i)*900000,end_ms:Date.now()-(95-i)*900000,level:null,runs:[]})),rate:{judged:0,ok:0},rate_24h:{judged:0,ok:0},rate_7d:{judged:0,ok:0}});
 const accounts = Array.from({length:40},(_,i)=>({id:'acct_'+i,name:'Account '+i,email:'test'+i+'@example.com',plan_type:'plus',enabled:true,credential_state:'ready',supported:true,token_expires_ms:null,running:null,methods:{turnstate:method(),modeltrace:method()}}));
 accounts[0].methods.turnstate.schedule.model='';accounts[0].methods.modeltrace.schedule.model='';
+accounts[0].methods.turnstate.health={level:'degraded',model:'gpt-6-astra',candidate:'ok',streak:2,changed_ms:Date.now(),last_run_id:'confirmed',notification_pending:1,notification_error:'TG 发送限流，稍后自动重试',notifications_dropped:0};
 const bank = {commit:'a'.repeat(40),source:'embedded',models:['gpt-6-astra'],checked_ms:0};
 window.codexProxyPlugin = {version:2,theme:'light',request:async request=>{
  window.__requests.push(request);
@@ -37,7 +38,8 @@ window.codexProxyPlugin = {version:2,theme:'light',request:async request=>{
    for(const id of body.account_ids){const account=accounts.find(a=>a.id===id);Object.assign(account.methods[body.method].schedule,Object.fromEntries(Object.entries(body).filter(([k])=>!['method','account_ids'].includes(k))));}
    return {status:200,contentType:'application/json',body:new TextEncoder().encode(JSON.stringify({updated:body.account_ids.length})).buffer};
  }
- const data = request.path === 'api/overview' ? {now_ms:Date.now(),range_hours:hours,config:{probe_enabled:false,min_interval_minutes:30,fingerprint_sync_hours:6},bank,accounts}
+ const data = request.path === 'api/overview' ? {now_ms:Date.now(),range_hours:hours,config:{probe_enabled:false,min_interval_minutes:30,fingerprint_sync_hours:6,telegram_enabled:true,telegram_configured:true},bank,accounts}
+ : request.path === 'api/telegram/test' ? {sent:true}
  : request.path === 'api/account' ? {account:accounts.find(a=>a.id===new URLSearchParams(request.query).get('id')),config:{probe_enabled:false}}
  : request.path === 'api/models' ? {bank:[{id:'gpt-6-astra',display_name:'GPT',family:'GPT'}],cpr:['gpt-6-astra'],aliases:{}}
  : request.path === 'api/plan' ? {blockers:[],request:{headers:{'User-Agent':'CPR identity'},body:'request details '.repeat(200)}}
@@ -156,6 +158,9 @@ try {
       assert(await evaluate(`window.__requests.some(r=>r.path==='api/overview'&&new URLSearchParams(r.query).get('hours')==='${range}')`,context),'Time range was not requested');
     }
     console.log(`PASS ${width}x${height} time filters request complete 24h / 7d / 30d ranges`);
+    await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='发送 TG 测试通知').click()",context);
+    await sleep(150);
+    assert(await evaluate("window.__requests.some(r=>r.path==='api/telegram/test')&&document.body.textContent.includes('TG 测试通知已发送')",context),'Telegram test action missing');
     await evaluate("document.querySelector('#app').scrollTop=0;document.querySelector('[data-account=acct_0] input[type=checkbox]').click();document.querySelector('[data-account=acct_1] input[type=checkbox]').click();",context);
     await sleep(100);
     await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='批量配置').click()",context);
@@ -172,6 +177,7 @@ try {
     await evaluate("document.querySelector('[aria-label=\"配置 test0@example.com\"]').click()",context);
     await sleep(300);
     assert(await evaluate("document.body.textContent.includes('自动探测')&&document.querySelectorAll('[role=combobox]').length>=2",context),'Per-account configuration missing');
+    assert(await evaluate("document.body.textContent.includes('当前判定')&&document.body.textContent.includes('正常 2/3')&&document.body.textContent.includes('TG 待发送 1 条')",context),'Health streak or notification status missing');
     console.log(`PASS ${width}x${height} method defaults, per-account controls and batch model configuration, no probe sent`);
 
 

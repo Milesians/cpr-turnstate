@@ -56,6 +56,7 @@ pub struct FakeHost {
     pub profile: Option<Value>,
     pub public_http: VecDeque<HttpReply>,
     pub seen_public_http: Vec<Value>,
+    pub seen_public_bodies: Vec<Value>,
     streams: HashMap<String, Vec<u8>>,
     next_version: u64,
 }
@@ -227,7 +228,11 @@ impl FakeHost {
             }
             "host.http.do_stream" => {
                 self.seen_public_http.push(params.clone());
-                assert!(payload.is_empty());
+                self.seen_public_bodies.push(if payload.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(payload).unwrap()
+                });
                 let Some(reply) = self.public_http.pop_front() else {
                     return Err(PluginFault::new(ErrorCode::Upstream, "offline in tests"));
                 };

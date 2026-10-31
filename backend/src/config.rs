@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
     /// 关闭时什么也发不出去
@@ -12,6 +12,10 @@ pub struct Config {
     pub min_interval_minutes: u32,
     /// 0 表示不同步，只用内置指纹库
     pub fingerprint_sync_hours: u32,
+    pub telegram_enabled: bool,
+    pub telegram_bot_token: String,
+    pub telegram_chat_id: String,
+    pub telegram_thread_id: u32,
 }
 
 impl Default for Config {
@@ -20,6 +24,10 @@ impl Default for Config {
             probe_enabled: false,
             min_interval_minutes: 30,
             fingerprint_sync_hours: 6,
+            telegram_enabled: false,
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            telegram_thread_id: 0,
         }
     }
 }

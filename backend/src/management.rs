@@ -51,6 +51,7 @@ pub fn registration() -> ManagementRegistration {
             route("POST", "api/schedule"),
             route("POST", "api/schedules/batch"),
             route("POST", "api/fingerprint/sync"),
+            route("POST", "api/telegram/test"),
         ],
         resources: ["web/index.html", "web/app.js", "web/app.css"]
             .into_iter()
@@ -155,6 +156,16 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
         ("POST", "api/fingerprint/sync") => {
             app.runner.bank.sync(host).await;
             Ok(json!({"bank": app.runner.bank.current().info}))
+        }
+        ("POST", "api/telegram/test") => {
+            crate::telegram::send(
+                host,
+                &app.runner.config,
+                "CPR 账号探测：TG 测试通知，连接成功。",
+            )
+            .await
+            .map_err(|e| ApiError::new(502, "telegram_failed", e.message))?;
+            Ok(json!({"sent": true}))
         }
         _ => Err(ApiError::new(404, "not_found", "没有这个接口")),
     }
@@ -289,6 +300,7 @@ struct MethodView {
     schedule: MethodSchedule,
     last_attempt: Option<LastAttempt>,
     latest: Option<Summary>,
+    health: Option<crate::health::HealthView>,
     slots: Vec<Slot>,
     rate: Rate,
     rate_24h: Rate,
@@ -372,10 +384,10 @@ async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, Api
             .unwrap_or_default();
         let mut methods = serde_json::Map::new();
         for method in Method::ALL {
-            let history = if supported(a) {
-                store::history(host, &a.account_id, method).await?
+            let (history, health) = if supported(a) {
+                store::history_with_health(host, &a.account_id, method).await?
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
             let view = MethodView {
                 schedule: schedule.get(method).clone(),
@@ -385,6 +397,7 @@ async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, Api
                     .rev()
                     .find(|s| s.status != Status::Running)
                     .cloned(),
+                health,
                 slots: slots(&history, now, hours),
                 rate: rate(&history, now - hours * HOUR_MS),
                 rate_24h: rate(&history, now - 24 * HOUR_MS),
@@ -406,6 +419,8 @@ async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, Api
             "probe_enabled": app.runner.config.probe_enabled,
             "min_interval_minutes": app.runner.config.min_interval_minutes,
             "fingerprint_sync_hours": app.runner.config.fingerprint_sync_hours,
+            "telegram_enabled": app.runner.config.telegram_enabled,
+            "telegram_configured": crate::telegram::configuration_error(&app.runner.config).is_none(),
         },
         "bank": app.runner.bank.current().info,
         "accounts": views,
@@ -421,7 +436,7 @@ async fn account_detail(app: &App, host: &HostClient, id: &str) -> Result<Value,
     let schedule = schedules.accounts.get(id).cloned().unwrap_or_default();
     let mut methods = serde_json::Map::new();
     for method in Method::ALL {
-        let mut history = store::history(host, id, method).await?;
+        let (mut history, health) = store::history_with_health(host, id, method).await?;
         history.reverse();
         methods.insert(
             method.as_str().into(),
@@ -429,6 +444,7 @@ async fn account_detail(app: &App, host: &HostClient, id: &str) -> Result<Value,
                 "schedule": schedule.get(method),
                 "last_attempt": app.scheduler.last(id, method),
                 "runs": history,
+                "health": health,
             }),
         );
     }

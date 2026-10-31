@@ -5,6 +5,7 @@ fn manifest_and_handlers_agree() {
     let manifest = manifest().unwrap();
     assert_eq!(manifest.plugin_id().unwrap(), PLUGIN_ID);
     plugin(Config::default()).unwrap();
+    assert!(manifest.secret_fields.contains("telegramBotToken"));
 }
 
 #[test]
@@ -12,6 +13,8 @@ fn config_defaults_keep_probes_off() {
     let config = Config::from_handshake(&serde_json::json!({}));
     assert!(!config.probe_enabled);
     assert_eq!(config.min_interval_minutes, 30);
+    assert!(!config.telegram_enabled);
+    assert!(config.telegram_bot_token.is_empty());
     let config = Config::from_handshake(&serde_json::json!({"probeEnabled": "yes"}));
     assert!(
         !config.probe_enabled,

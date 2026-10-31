@@ -7,6 +7,249 @@ use support::{FakeHost, HttpReply, Peer, ticket_reply};
 
 const ENABLED: fn() -> Value = || json!({"probeEnabled": true, "fingerprintSyncHours": 0});
 
+fn telegram_config() -> Value {
+    json!({"probeEnabled":true,"fingerprintSyncHours":0,"telegramEnabled":true,
+        "telegramBotToken":"12345:unit_test_token","telegramChatId":"-10012345","telegramThreadId":42})
+}
+
+fn telegram_reply(status: u16, body: Value) -> HttpReply {
+    HttpReply {
+        status,
+        headers: vec![],
+        body: serde_json::to_vec(&body).unwrap(),
+    }
+}
+
+fn legacy_health(host: &mut FakeHost, level: &str) {
+    host.state.insert(
+        ("history".into(), "acct_a/turnstate".into()),
+        (
+            json!({"runs":[{
+                "id":"legacy","model":"gpt-6-astra","trigger":"manual",
+                "started_ms":cpr_account_probe::clock::now_ms()-10000,
+                "finished_ms":cpr_account_probe::clock::now_ms()-9000,
+                "status":"done","level":level,"reason":"legacy","detail":false
+            }]}),
+            1,
+        ),
+    );
+}
+
+async fn ticket_probe(peer: &mut Peer, host: &mut FakeHost, level: &str) -> Value {
+    match level {
+        "ok" => {
+            host.http
+                .push_back(ticket_reply(Some("gAAAAAticket-a"), None));
+            host.http
+                .push_back(ticket_reply(Some("gAAAAAticket-a"), None));
+        }
+        "suspect" => {
+            host.http
+                .push_back(ticket_reply(Some("gAAAAAticket-a"), None));
+            host.http
+                .push_back(ticket_reply(Some("gAAAAAticket-b"), None));
+            host.http
+                .push_back(ticket_reply(Some("gAAAAAticket-b"), None));
+        }
+        "degraded" => {
+            for ticket in [
+                "gAAAAAticket-a",
+                "gAAAAAticket-b",
+                "gAAAAAticket-c",
+                "gAAAAAticket-d",
+            ] {
+                host.http.push_back(ticket_reply(Some(ticket), None));
+            }
+        }
+        _ => panic!("unknown fixture"),
+    }
+    let (status, body) = peer
+        .api(
+            "POST",
+            "api/probe",
+            "",
+            Some(json!({"account_id":"acct_a","method":"turnstate","model":"gpt-6-astra"})),
+            host,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["run"]["verdict"]["level"], level, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn telegram_recovery_regression_and_restart_preserve_raw_history() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    legacy_health(&mut host, "degraded");
+    let mut peer = Peer::start(telegram_config()).await;
+    for _ in 0..2 {
+        ticket_probe(&mut peer, &mut host, "ok").await;
+    }
+    assert!(host.seen_public_http.is_empty());
+    assert_eq!(
+        host.get("history", "acct_a/turnstate").unwrap()["health"]["level"],
+        "degraded"
+    );
+    // Restart the process after two successes; confirmation must still happen on the third.
+    drop(peer);
+    let mut peer = Peer::start(telegram_config()).await;
+    host.public_http
+        .push_back(telegram_reply(200, json!({"ok":true,"result":{}})));
+    ticket_probe(&mut peer, &mut host, "ok").await;
+    assert_eq!(host.seen_public_http.len(), 1);
+    let body = &host.seen_public_bodies[0];
+    assert_eq!(body["chat_id"], "-10012345");
+    assert_eq!(body["message_thread_id"], 42);
+    assert!(body["text"].as_str().unwrap().contains("降智 → 正常"));
+    assert!(body.get("parse_mode").is_none());
+    assert_eq!(
+        host.get("history", "acct_a/turnstate").unwrap()["health"]["level"],
+        "ok"
+    );
+    for _ in 0..3 {
+        ticket_probe(&mut peer, &mut host, "ok").await;
+    }
+    assert_eq!(
+        host.seen_public_http.len(),
+        1,
+        "unchanged health must not notify"
+    );
+    ticket_probe(&mut peer, &mut host, "suspect").await;
+    ticket_probe(&mut peer, &mut host, "degraded").await;
+    assert_eq!(
+        host.get("history", "acct_a/turnstate").unwrap()["health"]["level"],
+        "ok"
+    );
+    host.public_http
+        .push_back(telegram_reply(200, json!({"ok":true})));
+    ticket_probe(&mut peer, &mut host, "suspect").await;
+    assert_eq!(host.seen_public_http.len(), 2);
+    assert!(
+        host.seen_public_bodies[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("正常 → 降智")
+    );
+    let (_, overview) = peer
+        .api("GET", "api/overview", "hours=24", None, &mut host)
+        .await;
+    assert_eq!(
+        overview["accounts"][0]["methods"]["turnstate"]["health"]["level"],
+        "degraded"
+    );
+    let (_, detail) = peer
+        .api("GET", "api/account", "id=acct_a", None, &mut host)
+        .await;
+    assert_eq!(
+        detail["account"]["methods"]["turnstate"]["runs"][0]["level"],
+        "suspect"
+    );
+    let stored = serde_json::to_string(&host.state.values().collect::<Vec<_>>()).unwrap();
+    for text in [stored, overview.to_string(), detail.to_string()] {
+        assert!(!text.contains("unit_test_token"));
+        assert!(!text.contains("secret-access-token"));
+    }
+}
+
+#[tokio::test]
+async fn telegram_failure_is_durable_sanitized_and_retried_by_maintenance() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    legacy_health(&mut host, "suspect");
+    let mut peer = Peer::start(telegram_config()).await;
+    for _ in 0..2 {
+        ticket_probe(&mut peer, &mut host, "ok").await;
+    }
+    host.public_http.push_back(telegram_reply(
+        429,
+        json!({"ok":false,"error_code":429,
+        "description":"do not expose 12345:unit_test_token", "parameters":{"retry_after":180}}),
+    ));
+    let result = ticket_probe(&mut peer, &mut host, "ok").await;
+    assert_eq!(result["run"]["status"], "done");
+    let history = host.get("history", "acct_a/turnstate").unwrap();
+    assert_eq!(history["health"]["level"], "ok");
+    assert_eq!(history["notifications"][0]["attempts"], 1);
+    assert!(
+        history["notifications"][0]["retry_at_ms"].as_i64().unwrap()
+            > cpr_account_probe::clock::now_ms() + 170000
+    );
+    assert!(!history.to_string().contains("unit_test_token"));
+    peer.reconcile(&mut host).await;
+    assert_eq!(
+        host.seen_public_http.len(),
+        1,
+        "retry must respect retry_after"
+    );
+    host.state
+        .get_mut(&("history".into(), "acct_a/turnstate".into()))
+        .unwrap()
+        .0["notifications"][0]["retry_at_ms"] = json!(0);
+    drop(peer);
+    let mut peer = Peer::start(telegram_config()).await;
+    host.public_http
+        .push_back(telegram_reply(200, json!({"ok":true})));
+    peer.reconcile(&mut host).await;
+    assert_eq!(host.seen_public_http.len(), 2);
+    assert!(
+        host.get("history", "acct_a/turnstate")
+            .unwrap()
+            .get("notifications")
+            .is_none()
+    );
+    peer.reconcile(&mut host).await;
+    assert_eq!(host.seen_public_http.len(), 2);
+}
+
+#[tokio::test]
+async fn disabled_telegram_still_updates_health_without_backfill() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    legacy_health(&mut host, "degraded");
+    let mut peer = Peer::start(ENABLED()).await;
+    for _ in 0..3 {
+        ticket_probe(&mut peer, &mut host, "ok").await;
+    }
+    assert_eq!(
+        host.get("history", "acct_a/turnstate").unwrap()["health"]["level"],
+        "ok"
+    );
+    assert!(host.seen_public_http.is_empty());
+    drop(peer);
+    let mut peer = Peer::start(telegram_config()).await;
+    peer.reconcile(&mut host).await;
+    assert!(host.seen_public_http.is_empty());
+}
+
+#[tokio::test]
+async fn telegram_test_validates_config_and_redacts_api_errors() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    let mut config = telegram_config();
+    config["telegramBotToken"] = json!("123:token/../../evil");
+    let mut peer = Peer::start(config).await;
+    let (status, _) = peer
+        .api("POST", "api/telegram/test", "", Some(json!({})), &mut host)
+        .await;
+    assert_eq!(status, 502);
+    assert!(host.seen_public_http.is_empty());
+    drop(peer);
+    let mut peer = Peer::start(telegram_config()).await;
+    host.public_http.push_back(telegram_reply(
+        200,
+        json!({"ok":false,"error_code":401,"description":"12345:unit_test_token"}),
+    ));
+    let (status, error) = peer
+        .api("POST", "api/telegram/test", "", Some(json!({})), &mut host)
+        .await;
+    assert_eq!(status, 502);
+    assert!(!error.to_string().contains("unit_test_token"));
+    host.public_http
+        .push_back(telegram_reply(200, json!({"ok":true})));
+    let (status, body) = peer
+        .api("POST", "api/telegram/test", "", Some(json!({})), &mut host)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["sent"], true);
+}
+
 fn numbers(n: usize, seed: usize) -> String {
     (0..n)
         .map(|i| ((i * 37 + seed * 11) % 355 + 1).to_string())

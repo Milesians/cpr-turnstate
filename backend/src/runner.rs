@@ -273,7 +273,13 @@ impl Runner {
         let result = async {
             match method {
                 Method::Turnstate => {
-                    let version = store::save(host, &run, None).await?;
+                    let version = store::save_with_notifications(
+                        host,
+                        &run,
+                        None,
+                        self.config.telegram_enabled,
+                    )
+                    .await?;
                     match within_budget(host, self.turnstate(host, account, model)).await {
                         Ok(result) => {
                             run.verdict = Some(turnstate::verdict(&result));
@@ -282,7 +288,14 @@ impl Runner {
                         }
                         Err(error) => finish(&mut run, Some(error)),
                     }
-                    store::save(host, &run, Some(version)).await?;
+                    store::save_with_notifications(
+                        host,
+                        &run,
+                        Some(version),
+                        self.config.telegram_enabled,
+                    )
+                    .await?;
+                    crate::telegram::dispatch(host, &self.config, account).await;
                 }
                 Method::Modeltrace => {
                     let challenges = modeltrace::challenges()
@@ -418,7 +431,8 @@ impl Runner {
                     "探测中断（页面关闭或插件重启），没有完成",
                 )),
             );
-            store::save(host, &run, Some(version)).await?;
+            store::save_with_notifications(host, &run, Some(version), self.config.telegram_enabled)
+                .await?;
         }
         self.release(account_id, run_id);
         Ok(())

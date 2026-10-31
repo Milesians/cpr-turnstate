@@ -5,6 +5,7 @@ pub mod clock;
 pub mod codex;
 pub mod config;
 pub mod fingerprint;
+pub mod health;
 mod host;
 mod management;
 pub mod modeltrace;
@@ -12,6 +13,7 @@ mod runner;
 mod scheduler;
 mod session;
 pub mod store;
+mod telegram;
 pub mod turnstate;
 pub mod verdict;
 
