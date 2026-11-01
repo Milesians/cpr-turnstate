@@ -16,7 +16,7 @@ body {
 
 #app {
   /* CPR 按内容高度撑开 iframe。长列表在可视区内滚动，让 ZDialog 在窗口中居中。 */
-  height: var(--cp-plugin-viewport-height, 100dvh);
+  height: var(--plugin-viewport-height, var(--cp-plugin-viewport-height, 100dvh));
   overflow: auto;
   overscroll-behavior: contain;
 }

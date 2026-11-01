@@ -9,7 +9,10 @@ import { join } from 'node:path'
 import { resolveTheme } from '../frontend/node_modules/@codex-proxy/ui/dist/theme/index.js'
 
 assert(process.env.CHROME_BIN, 'Set CHROME_BIN to a headless Chrome binary')
-const tokens = Object.entries(resolveTheme('light', 'relay-blue', '#3b82f6').tokens).map(([key, value]) => `${key}:${value}`).join(';')
+const themes = Object.fromEntries(['light', 'dark'].map(mode => [mode, {
+  ...resolveTheme(mode, 'relay-blue', '#3b82f6').tokens,
+  '--cp-font-family': 'system-ui,sans-serif',
+}]))
 const dist = new URL('../frontend/dist/', import.meta.url)
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const fixture = `
@@ -19,7 +22,7 @@ const accounts = Array.from({length:40},(_,i)=>({id:'acct_'+i,name:'Account '+i,
 accounts[0].methods.turnstate.schedule.model='';accounts[0].methods.modeltrace.schedule.model='';
 accounts[0].methods.turnstate.health={level:'degraded',model:'gpt-6-astra',candidate:'ok',streak:2,changed_ms:Date.now(),last_run_id:'confirmed',notification_pending:1,notification_error:'TG 发送限流，稍后自动重试',notifications_dropped:0};
 const bank = {commit:'a'.repeat(40),source:'embedded',models:['gpt-6-astra'],checked_ms:0};
-window.codexProxyPlugin = {version:2,theme:'light',request:async request=>{
+window.codexProxyPlugin = {version:2,get theme(){return document.documentElement.dataset.theme},request:async request=>{
  window.__requests.push(request);
  const hours=Number(new URLSearchParams(request.query).get('hours')||24);
  const count=hours===168?84:hours===720?120:96;
@@ -61,7 +64,27 @@ addEventListener('message',e=>{if(e.source===frame.contentWindow&&typeof e.data?
     else if (path === '/plugin') {
       const html = await readFile(new URL('index.html', dist), 'utf8')
       res.setHeader('Content-Type', 'text/html')
-      res.end(html.replace('<head>', `<head><style>:root{${tokens};--cp-font-family:system-ui,sans-serif;--cp-plugin-viewport-height:${viewportHeight}px}html{overflow:hidden}body{display:flow-root;box-sizing:border-box;min-height:var(--cp-plugin-viewport-height)}</style><script>${fixture}</script>`))
+      // Like CPR, parse namespace metadata before installing the bridge. Do not inject
+      // cp tokens directly: that used to hide the new host's default z namespace.
+      const prefixMeta = html.match(/<meta\s+name="codex-proxy-ui-theme-prefix"[^>]*>/)?.[0] ?? ''
+      const viewportProperty = themeProtocol === 'modern' ? '--plugin-viewport-height' : '--cp-plugin-viewport-height'
+      const themeBridge = `
+        const themeProtocol=${JSON.stringify(themeProtocol)};
+        const themePayloads=${JSON.stringify(themes)};
+        const themePrefix=document.querySelector('meta[name="codex-proxy-ui-theme-prefix"]')?.content ?? 'z';
+        window.__setHostTheme=(name)=>{
+          const root=document.documentElement;
+          root.dataset.theme=name;root.style.colorScheme=name;
+          for(const [legacyName,value] of Object.entries(themePayloads[name])){
+            const token=legacyName.replace(/^--cp-/, '');
+            root.style.setProperty(themeProtocol==='modern'?'--'+themePrefix+'-'+token:legacyName,value);
+          }
+          window.dispatchEvent(new CustomEvent('codex-proxy-themechange',{detail:{theme:name}}));
+        };
+        document.documentElement.style.setProperty(${JSON.stringify(viewportProperty)},${JSON.stringify(`${viewportHeight}px`)});
+        window.__setHostTheme(${JSON.stringify(themeMode)});
+      `
+      res.end(html.replace(prefixMeta, '').replace('<head>', `<head>${prefixMeta}<style>html{overflow:hidden}body{display:flow-root;box-sizing:border-box;min-height:var(${viewportProperty})}</style><script>${themeBridge}${fixture}</script>`))
     }
     else if (path === '/app.js' || path === '/app.css') {
       res.setHeader('Content-Type', path.endsWith('.js') ? 'text/javascript' : 'text/css')
@@ -72,6 +95,8 @@ addEventListener('message',e=>{if(e.source===frame.contentWindow&&typeof e.data?
   catch (error) { res.writeHead(500); res.end(String(error)) }
 })
 let viewportHeight = 700
+let themeMode = 'light'
+let themeProtocol = 'legacy'
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
 const base = `http://127.0.0.1:${server.address().port}`
 const profile = await mkdtemp(join(tmpdir(), 'cpr-ui-'))
@@ -102,7 +127,9 @@ try {
     return reply.result.value
   }
   await send('Page.enable');await send('Runtime.enable')
-  for (const [width,height] of [[1280,900],[390,844]]) {
+  const matrix = ['legacy', 'modern'].flatMap(protocol => ['light', 'dark'].flatMap(mode => [[1280,900],[390,844]].map(([width,height]) => ({ protocol, mode, width, height }))))
+  for (const {protocol, mode, width, height} of matrix) {
+    themeMode=mode;themeProtocol=protocol;
     viewportHeight=height-100
     await send('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false})
     await send('Page.navigate',{url:base})
@@ -116,6 +143,43 @@ try {
     }
     assert(context, 'Plugin did not render: '+JSON.stringify({errors,frames:await send('Page.getFrameTree'),contexts:[...contexts]}))
     await sleep(300)
+    const assertTheme = async expected => {
+      const style = await evaluate(`(()=>{
+        const root=getComputedStyle(document.documentElement);
+        const summary=getComputedStyle(document.querySelector('.summary-item'));
+        const list=getComputedStyle(document.querySelector('.monitor-list'));
+        const input=getComputedStyle(document.querySelector('.monitor-search > span'));
+        const button=getComputedStyle(document.querySelector('.monitor-actions button'));
+        const empty=getComputedStyle(document.querySelector('.probe-cell[data-state=empty]'));
+        const resolve=(token)=>{const el=document.createElement('i');el.style.color='var('+token+')';document.body.append(el);const color=getComputedStyle(el).color;el.remove();return color};
+        return {theme:window.codexProxyPlugin.theme,layout:root.backgroundColor,expectedLayout:resolve('--cp-color-bg-layout'),
+          surface:summary.backgroundColor,expectedSurface:resolve('--cp-color-bg-container'),border:summary.borderTopColor,borderWidth:summary.borderTopWidth,
+          list:list.backgroundColor,input:input.backgroundColor,button:button.backgroundColor,empty:empty.backgroundColor,
+          text:root.color,expectedText:resolve('--cp-color-text'),appHeight:document.querySelector('#app').clientHeight,
+          token:root.getPropertyValue('--cp-color-bg-container').trim()};
+      })()`,context);
+      assert.equal(style.theme,expected);
+      assert(style.token,`Missing theme tokens: ${protocol}/${expected}`);
+      assert.equal(style.layout,style.expectedLayout,JSON.stringify(style));
+      assert.equal(style.text,style.expectedText,JSON.stringify(style));
+      assert.equal(style.surface,style.expectedSurface,JSON.stringify(style));
+      assert.equal(style.list,style.expectedSurface,JSON.stringify(style));
+      assert.equal(style.borderWidth,'1px',JSON.stringify(style));
+      assert(!['rgba(0, 0, 0, 0)','transparent'].includes(style.border),JSON.stringify(style));
+      for(const field of ['input','button','empty']) assert(!['rgba(0, 0, 0, 0)','transparent'].includes(style[field]),`Missing ${field} styling: ${JSON.stringify(style)}`);
+      assert.equal(style.appHeight,viewportHeight,`Viewport mismatch: ${protocol}/${expected}`);
+      return style;
+    };
+    const original=await assertTheme(mode);
+    const other=mode==='light'?'dark':'light';
+    await evaluate(`window.__setHostTheme('${other}')`,context);
+    await sleep(100);
+    const switched=await assertTheme(other);
+    assert.notEqual(original.surface,switched.surface,'Live theme change must update card surfaces');
+    await evaluate(`window.__setHostTheme('${mode}')`,context);
+    await sleep(100);
+    await assertTheme(mode);
+    console.log(`PASS ${protocol} ${mode} ${width}x${height}: surfaces, controls, empty cells, viewport and live theme switching`);
     for (const last of [false,true]) {
       await evaluate(`(()=>{const app=document.querySelector('#app');app.scrollTop=${last?'app.scrollHeight':'0'};const buttons=[...app.querySelectorAll('button')].filter(b=>b.textContent.trim()==='探测');buttons[${last?'buttons.length-1':'0'}].click()})()`,context)
       await sleep(300)
@@ -151,7 +215,7 @@ try {
     await evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}))",context);
     await sleep(200);
     const screenshot=await send('Page.captureScreenshot',{format:'png'});
-    await writeFile(join(tmpdir(),`cpr-ui-${width}.png`),Buffer.from(screenshot.data,'base64'));
+    await writeFile(join(tmpdir(),`cpr-ui-${protocol}-${mode}-${width}.png`),Buffer.from(screenshot.data,'base64'));
     for(const [label,range] of [['7 天',168],['30 天',720],['24 小时',24]]) {
       await evaluate(`([...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='${label}')).click()`,context);
       await sleep(300);

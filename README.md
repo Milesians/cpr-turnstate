@@ -4,6 +4,8 @@
 
 插件 ID `milesians.cpr-turnstate`（发布者 `milesians`），要求 CPR `>=3.34.0, <4.0.0`（清单 v2、RPC v7、`management` v2、`maintenance` v1）。SDK 和打包 CLI 都固定在 CPR 的 `v3.34.0`（`47d30474af7c3e1fab433f2d4a70430fae548ff2`）。
 
+前端显式声明 `codex-proxy-ui-theme-prefix=cp`，兼容 CPR 3.37.1 的新版主题桥接与旧版 `--cp-*` 主题变量；深浅色、字体和控件配色沿用宿主设置。页面高度同时兼容 `--plugin-viewport-height` 和旧版 `--cp-plugin-viewport-height`。
+
 ## 两种探测
 
 | | 测票 | ModelTrace |
