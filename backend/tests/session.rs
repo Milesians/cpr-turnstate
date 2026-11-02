@@ -851,52 +851,63 @@ async fn missing_cpr_identity_never_falls_back_to_an_invented_ua() {
 }
 
 #[tokio::test]
-async fn scheduled_modeltrace_advances_across_maintenance_calls() {
+async fn modeltrace_is_manual_only_and_old_schedules_are_ignored() {
     let mut host = FakeHost::new(&["acct_a"]);
     host.state.insert(("settings".into(),"schedules".into()), (json!({"accounts":{"acct_a":{"modeltrace":{"enabled":true,"model":"gpt-6-astra","interval_minutes":60}}}}),1));
-    for seed in 0..3 {
-        host.models.push_back(Ok(numbers(320, seed)));
-    }
+    host.models.push_back(Ok(numbers(320, 0)));
     let mut peer = Peer::start(ENABLED()).await;
-    peer.reconcile(&mut host).await;
+    for _ in 0..3 {
+        peer.reconcile(&mut host).await;
+    }
     assert!(
         host.seen_models.is_empty(),
-        "starting a run must not answer all three challenges"
+        "a saved ModelTrace schedule must not run"
     );
-    for answered in 1..=3 {
-        peer.reconcile(&mut host).await;
-        assert_eq!(host.seen_models.len(), answered);
-        let history = host.get("history", "acct_a/modeltrace").unwrap();
-        assert_eq!(
-            history["runs"].as_array().unwrap().len(),
-            1,
-            "must keep the same run"
-        );
-        assert_eq!(
-            history["runs"][0]["status"],
-            if answered == 3 { "done" } else { "running" }
-        );
-    }
-    peer.reconcile(&mut host).await;
-    assert_eq!(
-        host.seen_models.len(),
-        3,
-        "completed run must respect the schedule interval"
-    );
-}
+    assert!(host.get("history", "acct_a/modeltrace").is_none());
+    let (_, overview) = peer.api("GET", "api/overview", "", None, &mut host).await;
+    let schedule = &overview["accounts"][0]["methods"]["modeltrace"]["schedule"];
+    assert_eq!(schedule["enabled"], false);
+    assert_eq!(schedule["model"], "gpt-6-astra");
 
-#[tokio::test]
-async fn scheduled_modeltrace_rechecks_account_before_the_next_challenge() {
-    let mut host = FakeHost::new(&["acct_a"]);
-    host.state.insert(("settings".into(),"schedules".into()), (json!({"accounts":{"acct_a":{"modeltrace":{"enabled":true,"model":"gpt-6-astra","interval_minutes":60}}}}),1));
-    let mut peer = Peer::start(ENABLED()).await;
-    peer.reconcile(&mut host).await;
-    host.accounts[0]["enabled"] = json!(false);
-    peer.reconcile(&mut host).await;
-    assert!(host.seen_models.is_empty());
+    let (status, body) = peer
+        .api("POST", "api/schedule", "", Some(json!({"account_id":"acct_a","method":"modeltrace","enabled":true,"model":"gpt-6-astra","interval_minutes":60})), &mut host)
+        .await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = peer
+        .api(
+            "POST",
+            "api/schedules/batch",
+            "",
+            Some(json!({"account_ids":["acct_a"],"method":"modeltrace","enabled":true})),
+            &mut host,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = peer
+        .api("POST", "api/schedule", "", Some(json!({"account_id":"acct_a","method":"modeltrace","enabled":false,"model":"gpt-6.1-sol","interval_minutes":60})), &mut host)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["schedule"]["modeltrace"]["enabled"], false);
+
+    // Manual ModelTrace still runs and is recorded.
+    let (status, body) = peer
+        .api(
+            "POST",
+            "api/probe",
+            "",
+            Some(json!({"account_id":"acct_a","method":"modeltrace","model":"gpt-6-astra"})),
+            &mut host,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["run"]["status"], "running", "{body}");
+    assert_eq!(body["run"]["trigger"], "manual");
     assert_eq!(
-        host.get("history", "acct_a/modeltrace").unwrap()["runs"][0]["status"],
-        "failed"
+        host.get("history", "acct_a/modeltrace").unwrap()["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
 }
 
@@ -1027,7 +1038,8 @@ async fn batch_configuration_changes_only_selected_fields_accounts_and_method() 
     );
     assert_eq!(
         state["accounts"]["acct_a"]["modeltrace"],
-        json!({"enabled":true,"model":"trace-a","interval_minutes":120})
+        json!({"enabled":false,"model":"trace-a","interval_minutes":120}),
+        "the old ModelTrace switch is dropped, its model and interval kept"
     );
     assert_eq!(
         state["accounts"]["acct_c"]["turnstate"]["interval_minutes"],

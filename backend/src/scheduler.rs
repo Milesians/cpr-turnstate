@@ -1,6 +1,7 @@
 //! 自动探测：宿主每轮维护（`plugin.reconcile`，每轮结束后约 30 秒）找到期的任务，
 //! 经运行器发起，和手动探测同一套安全闸
 //!
+//! 只有测票能自动探测，ModelTrace 只手动探测。
 //! 同账号串行，全局最多 [`MAX_CONCURRENT`] 个；忙碌的下一轮重试，其他拦截 10 分钟后重试。
 //! 上游拒绝后不冷却。
 
@@ -35,8 +36,6 @@ pub struct LastAttempt {
 
 #[derive(Default)]
 struct State {
-    /// 自动 ModelTrace 的进行中记录，每轮维护只答一道题。
-    pending: HashMap<String, String>,
     /// 上次开始探测的时间，启动后第一次用到时从历史读
     last_started: HashMap<(String, Method), i64>,
     /// 被拦截后什么时候再试
@@ -102,35 +101,6 @@ impl Scheduler {
             runner.abandon(host, &account_id, &run_id).await?;
         }
         self.recover(runner, host, &accounts).await?;
-        let pending = lock(&self.state).pending.clone();
-        let progressed: std::collections::HashSet<_> = pending.keys().cloned().collect();
-        join_all(pending.into_iter().map(|(account_id, run_id)| async move {
-            let result = async {
-                let Some((run, version)) = store::run(host, &run_id).await? else {
-                    runner.release(&account_id, &run_id);
-                    return Ok::<_, PluginFault>(false);
-                };
-                let run = runner.advance(host, run, version).await?;
-                Ok(run.status == Status::Running)
-            }
-            .await;
-            match result {
-                Ok(true) => {}
-                Ok(false) => {
-                    lock(&self.state).pending.remove(&account_id);
-                }
-                Err(error) => {
-                    host::log(
-                        host,
-                        "scheduled_probe_step_failed",
-                        LogLevel::Warn,
-                        json!({"code": format!("{:?}", error.code)}),
-                    )
-                    .await;
-                }
-            }
-        }))
-        .await;
         if !runner.config.probe_enabled {
             return Ok(());
         }
@@ -144,16 +114,12 @@ impl Scheduler {
         let now = now_ms();
         let mut due: Vec<(i64, &AuthRuntimeAccount, Method, String)> = Vec::new();
         for (account_id, schedule) in &schedules.accounts {
-            // 已推进的账号本轮不再启动其他方法，保留每个调用的网络预算。
-            if progressed.contains(account_id) {
-                continue;
-            }
             let Some(account) = by_id.get(account_id.as_str()) else {
                 continue;
             };
             for method in Method::ALL {
                 let s = schedule.get(method);
-                if !s.enabled || s.model.is_empty() {
+                if !method.schedulable() || !s.enabled || s.model.is_empty() {
                     continue;
                 }
                 let key = (account_id.clone(), method);
@@ -229,11 +195,9 @@ impl Scheduler {
             {
                 Ok(Ok(run)) => {
                     attempt.started = true;
-                    let mut state = lock(&self.state);
-                    state.last_started.insert(key.clone(), run.started_ms);
-                    if run.status == Status::Running {
-                        state.pending.insert(account.account_id.clone(), run.id);
-                    }
+                    lock(&self.state)
+                        .last_started
+                        .insert(key.clone(), run.started_ms);
                 }
                 Ok(Err(blockers)) => attempt.blockers = blockers,
                 Err(error) => {

@@ -24,6 +24,8 @@ export type Status = 'running' | 'done' | 'failed'
 
 export const methods: Method[] = ['turnstate', 'modeltrace']
 export const methodLabel: Record<Method, string> = { turnstate: '测票', modeltrace: 'ModelTrace' }
+/** 只有测票能自动探测、在列表显示探针块；ModelTrace 只手动探测，记录在详情页 */
+export const scheduledMethods: Method[] = ['turnstate']
 
 export interface Blocker {
   code: string

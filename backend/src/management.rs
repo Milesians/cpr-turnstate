@@ -618,6 +618,9 @@ async fn schedule(host: &HostClient, req: ScheduleRequest) -> Result<Value, ApiE
     if !req.model.is_empty() && !crate::codex::valid_model(&req.model) {
         return Err(ApiError::invalid("模型名无效"));
     }
+    if req.enabled && !req.method.schedulable() {
+        return Err(ApiError::invalid("ModelTrace 只支持手动探测"));
+    }
     if req.enabled && req.model.is_empty() {
         return Err(ApiError::invalid("开启自动探测前先选择模型"));
     }
@@ -661,6 +664,9 @@ async fn batch_schedule(host: &HostClient, req: BatchScheduleRequest) -> Result<
         model: req.model,
         interval_minutes: req.interval_minutes,
     };
+    if patch.enabled == Some(true) && !req.method.schedulable() {
+        return Err(ApiError::invalid("ModelTrace 只支持手动探测"));
+    }
     if patch.enabled.is_none() && patch.model.is_none() && patch.interval_minutes.is_none() {
         return Err(ApiError::invalid("请至少选择一项要修改的配置"));
     }

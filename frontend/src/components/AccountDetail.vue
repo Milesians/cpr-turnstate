@@ -3,7 +3,7 @@ import type { AccountDetail, Method, Models, Run, Schedule } from '../api'
 import { ZButton, ZCard, ZDialog, ZEmpty, ZInputNumber, ZSelect, ZSwitch, ZTag } from '@codex-proxy/ui'
 import { ArrowLeft } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef } from 'vue'
-import { api, methodLabel, methods } from '../api'
+import { api, methodLabel, methods, scheduledMethods } from '../api'
 import { dateTime, levelLabel, levelTag, statusLabel } from '../format'
 import { defaultModels } from '../probe-models'
 import ProbeDialog from './ProbeDialog.vue'
@@ -129,7 +129,7 @@ onMounted(async () => {
             <span v-if="detail.account.methods[m].health!.notification_error" class="w-full text-cp-xs text-cp-warning-text">{{ detail.account.methods[m].health!.notification_error }}</span>
             <span v-if="detail.account.methods[m].health!.notifications_dropped" class="w-full text-cp-xs text-cp-warning-text">通知长期未送达，已丢弃 {{ detail.account.methods[m].health!.notifications_dropped }} 条最旧通知</span>
           </div>
-          <div class="flex flex-wrap items-center gap-3">
+          <div v-if="scheduledMethods.includes(m)" class="flex flex-wrap items-center gap-3">
             <ZSwitch v-model="drafts[m].enabled" label="自动探测" :disabled="saving === m" @change="save(m)" />
             <ZSelect v-model="drafts[m].model" :options="modelOptions" filterable placeholder="模型" class="w-56" :disabled="saving === m" @change="save(m)" />
             <span class="flex items-center gap-2">
@@ -137,7 +137,10 @@ onMounted(async () => {
               <ZInputNumber v-model="drafts[m].interval_minutes" :min="1" :max="10080" unit="分钟" class="w-36" :disabled="saving === m" @change="save(m)" />
             </span>
           </div>
-          <div v-if="detail.account.methods[m].last_attempt?.blockers?.length" class="text-cp-xs text-cp-text-tertiary">
+          <p v-else class="m-0 text-cp-xs text-cp-text-tertiary">
+            只支持手动探测，点“立即探测”在弹窗里选模型
+          </p>
+          <div v-if="scheduledMethods.includes(m) && detail.account.methods[m].last_attempt?.blockers?.length" class="text-cp-xs text-cp-text-tertiary">
             上次自动探测 {{ dateTime(detail.account.methods[m].last_attempt!.at_ms) }} 被拦截：{{ detail.account.methods[m].last_attempt!.blockers!.map(b => b.message).join('；') }}
           </div>
           <ZEmpty v-if="!detail.account.methods[m].runs.length" size="small" title="还没有探测记录" />

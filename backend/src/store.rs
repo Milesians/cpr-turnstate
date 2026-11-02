@@ -51,6 +51,12 @@ impl Method {
         }
     }
 
+    /// 只有测票支持自动探测；ModelTrace 只手动探测（用户 2026-11-02）
+    #[must_use]
+    pub const fn schedulable(self) -> bool {
+        matches!(self, Self::Turnstate)
+    }
+
     #[must_use]
     pub const fn default_model(self) -> &'static str {
         match self {
@@ -313,8 +319,13 @@ pub async fn schedules(host: &HostClient) -> Result<(Schedules, Option<u64>), Pl
         };
     for account in schedules.accounts.values_mut() {
         for method in Method::ALL {
-            if account.get(method).model.is_empty() {
-                account.get_mut(method).model = method.default_model().into();
+            let schedule = account.get_mut(method);
+            if schedule.model.is_empty() {
+                schedule.model = method.default_model().into();
+            }
+            // 旧版保存的 ModelTrace 自动探测开关作废
+            if !method.schedulable() {
+                schedule.enabled = false;
             }
         }
     }

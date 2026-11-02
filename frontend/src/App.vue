@@ -4,7 +4,7 @@ import { ZButton, ZCheckbox, ZConfigProvider, ZEmpty, ZInput, ZSegmented, ZTag }
 import { zhHans } from '@codex-proxy/ui/locale'
 import { Activity, RefreshCw, Search, Settings2 } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
-import { api, methodLabel, methods } from './api'
+import { api, methodLabel, scheduledMethods } from './api'
 import AccountDetail from './components/AccountDetail.vue'
 import BatchConfigDialog from './components/BatchConfigDialog.vue'
 import ProbeDialog from './components/ProbeDialog.vue'
@@ -103,9 +103,6 @@ function probe(account: OverviewAccount) {
   dialogAccount.value = account
   dialog.value = true
 }
-function defaultMethod(a: OverviewAccount): Method {
-  return a.methods.modeltrace.schedule.enabled && !a.methods.turnstate.schedule.enabled ? 'modeltrace' : 'turnstate'
-}
 watch(hours, () => {
   overview.value = null
   load()
@@ -171,7 +168,7 @@ onMounted(() => Promise.all([load(), loadModels()]))
               </button>
             </div>
             <div class="monitor-tracks">
-              <div v-for="m in methods" :key="m" class="monitor-track">
+              <div v-for="m in scheduledMethods" :key="m" class="monitor-track">
                 <span class="track-label">{{ methodLabel[m] }}</span>
                 <ProbeStrip :slots="a.methods[m].slots" @open="run => selected = { id: a.id, run }" />
                 <span class="track-rate" :class="{ 'rate-empty': !a.methods[m].rate.judged }" :title="`${rangeLabel}内 ${a.methods[m].rate.ok} / ${a.methods[m].rate.judged} 次有效判定为正常；失败、未判定和无探测不计入`">{{ rate(a.methods[m].rate) }}</span>
@@ -196,7 +193,7 @@ onMounted(() => Promise.all([load(), loadModels()]))
           <span v-if="overview?.bank.error" class="w-full text-cp-warning-text">{{ overview.bank.error }}</span>
         </footer>
         <BatchConfigDialog v-model="batchOpen" :account-ids="selectedIds" :models="models" @done="batchDone" />
-        <ProbeDialog v-if="dialogAccount" v-model="dialog" :account-id="dialogAccount.id" :account-name="dialogAccount.email || dialogAccount.name" :method="defaultMethod(dialogAccount)" :saved-models="{ turnstate: dialogAccount.methods.turnstate.schedule.model, modeltrace: dialogAccount.methods.modeltrace.schedule.model }" :models="models" @done="load" />
+        <ProbeDialog v-if="dialogAccount" v-model="dialog" :account-id="dialogAccount.id" :account-name="dialogAccount.email || dialogAccount.name" method="turnstate" :saved-models="{ turnstate: dialogAccount.methods.turnstate.schedule.model, modeltrace: dialogAccount.methods.modeltrace.schedule.model }" :models="models" @done="load" />
       </template>
     </main>
   </ZConfigProvider>
