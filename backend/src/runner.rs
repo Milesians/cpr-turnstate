@@ -280,13 +280,39 @@ impl Runner {
                         self.config.telegram_enabled,
                     )
                     .await?;
-                    match within_budget(host, self.turnstate(host, account, model)).await {
+                    // 过载就再测，最多再测 OVERLOAD_RETRIES 次；每次都过载算降智
+                    let mut retries = 0;
+                    let outcome = loop {
+                        let outcome =
+                            within_budget(host, self.turnstate(host, account, model)).await;
+                        let overloaded =
+                            matches!(&outcome, Err(e) if e.overloaded_verdict().is_some());
+                        if !overloaded
+                            || retries == OVERLOAD_RETRIES
+                            || host
+                                .remaining_budget()
+                                .is_some_and(|b| b < OVERLOAD_RETRY_BUDGET)
+                        {
+                            break outcome;
+                        }
+                        retries += 1;
+                        tokio::time::sleep(OVERLOAD_RETRY_DELAY).await;
+                    };
+                    match outcome {
                         Ok(result) => {
                             run.verdict = Some(turnstate::verdict(&result));
                             run.turnstate = Some(result);
                             finish(&mut run, None);
                         }
-                        Err(error) => finish(&mut run, Some(error)),
+                        Err(error) => {
+                            let persistent = (retries == OVERLOAD_RETRIES)
+                                .then(|| error.persistent_overload_verdict(retries + 1))
+                                .flatten();
+                            finish(&mut run, Some(error));
+                            if persistent.is_some() {
+                                run.verdict = persistent;
+                            }
+                        }
                     }
                     store::save_with_notifications(
                         host,
@@ -572,6 +598,12 @@ impl Runner {
 }
 
 use crate::host;
+
+/// 测票遇到上游过载后最多再测几次；都还是过载就判降智
+pub const OVERLOAD_RETRIES: usize = 3;
+const OVERLOAD_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// 剩余时间不够再测一次就不再测，按单次过载（疑似）记
+const OVERLOAD_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
 /// 给结果落库留出时间，避免宿主结束 RPC 后记录还停在“进行中”。
 async fn within_budget<T>(

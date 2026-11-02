@@ -214,8 +214,9 @@ impl History {
             return;
         }
         if let Some((from, to)) = transition {
-            // A fresh healthy baseline is not a recovery notification.
-            if from == Level::Unknown && to == Level::Ok {
+            // A fresh healthy baseline is not a recovery notification, and
+            // 降智 ↔ 疑似 stays abnormal: only crossing normal/abnormal alerts.
+            if (from == Level::Unknown && to == Level::Ok) || (from.abnormal() && to.abnormal()) {
                 return;
             }
             if self.notifications.len() == 32 {

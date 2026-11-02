@@ -33,10 +33,6 @@ impl Default for Health {
     }
 }
 
-fn abnormal(level: Level) -> bool {
-    matches!(level, Level::Suspect | Level::Degraded)
-}
-
 impl Health {
     /// Preserve the latest legacy verdict as a baseline, without retroactive alerts.
     pub fn from_history(runs: &[Summary]) -> Self {
@@ -79,7 +75,7 @@ impl Health {
         let level = level.unwrap();
         if self
             .candidate
-            .is_some_and(|c| c == level || (abnormal(c) && abnormal(level)))
+            .is_some_and(|c| c == level || (c.abnormal() && level.abnormal()))
         {
             self.candidate = Some(self.candidate.unwrap().max(level));
             self.streak += 1;

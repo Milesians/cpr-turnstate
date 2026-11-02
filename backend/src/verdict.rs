@@ -12,6 +12,14 @@ pub enum Level {
     Degraded,
 }
 
+impl Level {
+    /// 降智和疑似都是非正常账号
+    #[must_use]
+    pub const fn abnormal(self) -> bool {
+        matches!(self, Self::Suspect | Self::Degraded)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdict {
     pub level: Level,
@@ -56,6 +64,17 @@ impl UpstreamError {
             Verdict::new(
                 Level::Suspect,
                 format!("上游返回过载（{self}），按疑似降智处理"),
+            )
+        })
+    }
+
+    /// 连续 `attempts` 次测票都是上游过载：按降智处理
+    #[must_use]
+    pub fn persistent_overload_verdict(&self, attempts: usize) -> Option<Verdict> {
+        self.overloaded_verdict().map(|_| {
+            Verdict::new(
+                Level::Degraded,
+                format!("连续 {attempts} 次测票上游都返回过载（{self}），按降智处理"),
             )
         })
     }

@@ -152,6 +152,48 @@ async fn telegram_recovery_regression_and_restart_preserve_raw_history() {
 }
 
 #[tokio::test]
+async fn telegram_only_alerts_when_crossing_normal_and_abnormal() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    legacy_health(&mut host, "ok");
+    let mut peer = Peer::start(telegram_config()).await;
+    host.public_http
+        .push_back(telegram_reply(200, json!({"ok":true})));
+    for _ in 0..3 {
+        ticket_probe(&mut peer, &mut host, "degraded").await;
+    }
+    assert_eq!(host.seen_public_http.len(), 1);
+    assert!(
+        host.seen_public_bodies[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("正常 → 降智")
+    );
+    for _ in 0..3 {
+        ticket_probe(&mut peer, &mut host, "suspect").await;
+    }
+    let history = host.get("history", "acct_a/turnstate").unwrap();
+    assert_eq!(history["health"]["level"], "suspect");
+    assert!(history.get("notifications").is_none());
+    assert_eq!(
+        host.seen_public_http.len(),
+        1,
+        "降智 → 疑似 is still abnormal and must not notify"
+    );
+    host.public_http
+        .push_back(telegram_reply(200, json!({"ok":true})));
+    for _ in 0..3 {
+        ticket_probe(&mut peer, &mut host, "ok").await;
+    }
+    assert_eq!(host.seen_public_http.len(), 2);
+    assert!(
+        host.seen_public_bodies[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("疑似 → 正常")
+    );
+}
+
+#[tokio::test]
 async fn telegram_failure_is_durable_sanitized_and_retried_by_maintenance() {
     let mut host = FakeHost::new(&["acct_a"]);
     legacy_health(&mut host, "suspect");
@@ -395,6 +437,58 @@ async fn turnstate_echoes_the_ticket_through_the_account_proxy() {
         )
         .await;
     assert_eq!(status, 404);
+}
+
+fn overloaded_reply() -> HttpReply {
+    HttpReply {
+        status: 503,
+        headers: vec![],
+        body: br#"{"error":{"message":"Our servers are currently overloaded"}}"#.to_vec(),
+    }
+}
+
+async fn turnstate_probe(peer: &mut Peer, host: &mut FakeHost) -> Value {
+    let (status, body) = peer
+        .api(
+            "POST",
+            "api/probe",
+            "",
+            Some(json!({"account_id":"acct_a","method":"turnstate","model":"gpt-6-astra"})),
+            host,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn persistent_overload_is_degraded_after_three_retries() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    for _ in 0..4 {
+        host.http.push_back(overloaded_reply());
+    }
+    let mut peer = Peer::start(ENABLED()).await;
+    let body = turnstate_probe(&mut peer, &mut host).await;
+    assert_eq!(body["run"]["status"], "done", "{body}");
+    assert_eq!(body["run"]["verdict"]["level"], "degraded", "{body}");
+    assert_eq!(body["run"]["error"]["kind"], "overloaded");
+    assert_eq!(host.seen_http.len(), 4);
+}
+
+#[tokio::test]
+async fn overload_is_retried_and_a_later_answer_decides() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.http.push_back(overloaded_reply());
+    host.http.push_back(overloaded_reply());
+    host.http
+        .push_back(ticket_reply(Some("gAAAAAticket-a"), None));
+    host.http
+        .push_back(ticket_reply(Some("gAAAAAticket-a"), None));
+    let mut peer = Peer::start(ENABLED()).await;
+    let body = turnstate_probe(&mut peer, &mut host).await;
+    assert_eq!(body["run"]["verdict"]["level"], "ok", "{body}");
+    assert!(body["run"]["error"].is_null(), "{body}");
+    assert_eq!(host.seen_http.len(), 4);
 }
 
 #[tokio::test]
