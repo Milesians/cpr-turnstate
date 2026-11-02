@@ -87,6 +87,8 @@ pub struct Runner {
     key: Mutex<Option<String>>,
     /// 测完测票、当前判定可能变了的账号；自动分组取走后只重读这些
     turnstate_finished: Mutex<HashSet<String>>,
+    /// ModelTrace 用的插件分组在 CPR 里的 ID
+    probe_group: Mutex<Option<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -108,7 +110,14 @@ impl Runner {
             busy: Mutex::new(HashMap::new()),
             key: Mutex::new(None),
             turnstate_finished: Mutex::new(HashSet::new()),
+            probe_group: Mutex::new(None),
         }
+    }
+
+    /// ModelTrace 用的插件分组的 ID（建过之后才有）
+    #[must_use]
+    pub fn probe_group_id(&self) -> Option<String> {
+        lock(&self.probe_group).clone()
     }
 
     /// 取走上次以来测完测票的账号
@@ -508,13 +517,15 @@ impl Runner {
         if let Some(key) = lock(&self.key).clone() {
             return Ok(key);
         }
-        host.ensure_group(GroupEnsureRequest {
-            resource_key: RESOURCE_KEY.into(),
-            name: "账号探测".into(),
-            color: "#6366F1FF".into(),
-            description: Some("账号探测插件的 ModelTrace 用，成员由插件维护".into()),
-        })
-        .await?;
+        let group = host
+            .ensure_group(GroupEnsureRequest {
+                resource_key: RESOURCE_KEY.into(),
+                name: "账号探测".into(),
+                color: "#6366F1FF".into(),
+                description: Some("账号探测插件的 ModelTrace 用，成员由插件维护".into()),
+            })
+            .await?;
+        *lock(&self.probe_group) = Some(group.id);
         let key = host
             .ensure_key(KeyEnsureRequest {
                 resource_key: RESOURCE_KEY.into(),

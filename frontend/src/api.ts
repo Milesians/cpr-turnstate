@@ -257,8 +257,10 @@ async function call<T>(method: 'GET' | 'POST', path: string, query?: Record<stri
 }
 
 export interface GroupRule {
-  /** 新规则没有 id；保存后由插件分配，也是 CPR 里的资源键 */
+  /** 新规则没有 id；保存后由插件分配 */
   id?: string
+  /** CPR 现有分组的 ID；没有就是插件新建的分组 */
+  group_id?: string
   name: string
   color: string
   levels: Level[]
@@ -278,6 +280,17 @@ export interface GroupsView {
   retired: number
   max_rules: number
   status: { synced_ms: number, error?: string, rules: Record<string, GroupRuleStatus> }
+  /** 没配好 CPR 地址或管理 API Key 时的原因；为空表示可以选现有分组 */
+  admin_error?: string | null
+}
+
+export interface CprGroup {
+  id: string
+  name: string
+  color: string
+  enabled: boolean
+  /** 插件自己维护成员的分组，不能选 */
+  plugin: boolean
 }
 
 export const api = {
@@ -294,6 +307,7 @@ export const api = {
   testTelegram: () => call<{ sent: boolean }>('POST', 'api/telegram/test', undefined, {}),
   groups: () => call<GroupsView>('GET', 'api/groups'),
   saveGroups: (enabled: boolean, rules: GroupRule[]) => call<GroupsView>('POST', 'api/groups', undefined, { enabled, rules }),
+  cprGroups: () => call<{ groups: CprGroup[] }>('GET', 'api/groups/cpr'),
 }
 
 /** 发起一次探测；ModelTrace 由页面逐题推进，直到完成 */

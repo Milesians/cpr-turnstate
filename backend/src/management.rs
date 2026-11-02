@@ -53,6 +53,7 @@ pub fn registration() -> ManagementRegistration {
             route("POST", "api/fingerprint/sync"),
             route("POST", "api/telegram/test"),
             route("GET", "api/groups"),
+            route("GET", "api/groups/cpr"),
             route("POST", "api/groups"),
         ],
         resources: ["web/index.html", "web/app.js", "web/app.css"]
@@ -170,6 +171,7 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
             Ok(json!({"sent": true}))
         }
         ("GET", "api/groups") => groups_view(app, host).await,
+        ("GET", "api/groups/cpr") => cpr_groups(app, host).await,
         ("POST", "api/groups") => save_groups(app, host, decode(call)?).await,
         _ => Err(ApiError::new(404, "not_found", "没有这个接口")),
     }
@@ -183,7 +185,27 @@ async fn groups_view(app: &App, host: &HostClient) -> Result<Value, ApiError> {
         "retired": config.retired.len(),
         "max_rules": crate::groups::MAX_RULES,
         "status": app.groups.status(),
+        "admin_error": crate::admin::base_url(&app.runner.config).err(),
     }))
+}
+
+/// 页面下拉框用的 CPR 现有分组；插件自己维护成员的标成不可选
+async fn cpr_groups(app: &App, host: &HostClient) -> Result<Value, ApiError> {
+    let admin = crate::admin::Admin::new(host, &app.runner.config)
+        .map_err(|reason| ApiError::new(409, "admin_not_configured", reason))?;
+    let groups = admin
+        .groups()
+        .await
+        .map_err(|reason| ApiError::new(502, "admin_failed", reason))?;
+    let forbidden = app.groups.plugin_group_ids(&app.runner);
+    let groups: Vec<Value> = groups
+        .into_iter()
+        .map(|g| {
+            let plugin = forbidden.contains(&g.id);
+            json!({"id": g.id, "name": g.name, "color": g.color, "enabled": g.enabled, "plugin": plugin})
+        })
+        .collect();
+    Ok(json!({"groups": groups}))
 }
 
 async fn save_groups(
@@ -191,8 +213,30 @@ async fn save_groups(
     host: &HostClient,
     input: crate::groups::ConfigInput,
 ) -> Result<Value, ApiError> {
+    // 选了现有分组时先读 CPR 的分组，核对分组存在
+    let groups = if input
+        .rules
+        .iter()
+        .any(|r| r.group_id.as_deref().is_some_and(|g| !g.is_empty()))
+    {
+        let admin =
+            crate::admin::Admin::new(host, &app.runner.config).map_err(ApiError::invalid)?;
+        Some(
+            admin
+                .groups()
+                .await
+                .map_err(|reason| ApiError::new(502, "admin_failed", reason))?,
+        )
+    } else {
+        None
+    };
+    let forbidden = app.groups.plugin_group_ids(&app.runner);
+    let existing = crate::groups::Existing {
+        groups: groups.as_deref(),
+        forbidden: &forbidden,
+    };
     store::update_group_config(host, |config| {
-        *config = crate::groups::apply_input(config, input.clone())?;
+        *config = crate::groups::apply_input(config, input.clone(), &existing)?;
         Ok(())
     })
     .await?

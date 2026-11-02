@@ -1,8 +1,12 @@
-//! 自动分组：按测票当前判定（连续 3 次确认的那个）调整插件自己的 CPR 分组成员
+//! 自动分组：按测票当前判定（连续 3 次确认的那个）调整 CPR 分组成员
 //!
-//! CPR 只允许插件改自己建的分组（按 resource_key），不能动管理员手建的分组。
-//! 分组名和颜色只在第一次创建时使用，之后在 CPR 的分组管理里改；管理员删掉分组后下次同步重建。
-//! 关闭自动分组后成员保持原样；删掉的规则先清空成员再丢掉。
+//! 两种规则：
+//! - 插件新建的分组：插件 SDK 只允许插件改自己建的分组（按 resource_key）。分组名和颜色只在第一次
+//!   创建时使用，之后在 CPR 的分组管理里改；管理员删掉分组后下次同步重建；删掉规则先清空成员再丢掉。
+//! - CPR 现有分组（用户 2026-11-02）：SDK 改不了，经 CPR 管理员接口（[`crate::admin`]）读账号现在
+//!   所在的全部分组，换掉规则管的那几个后整体写回（CPR 只支持整体替换）；删掉规则只是不再调整。
+//!
+//! 关闭自动分组后成员保持原样。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -17,6 +21,7 @@ use gateway_plugin_sdk::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::admin::{Admin, GroupRef};
 use crate::clock::now_ms;
 use crate::runner::{Runner, supported};
 use crate::store::{self, Method};
@@ -31,20 +36,34 @@ const RETRY_MS: i64 = 60 * 1000;
 const CHUNK: usize = 200;
 const RULE_PREFIX: &str = "auto-";
 
+/// CPR 分组 ID：`grp_` 加 32 位小写十六进制
+fn valid_group_id(id: &str) -> bool {
+    id.strip_prefix("grp_").is_some_and(|rest| {
+        rest.len() == 32
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GroupConfig {
     pub enabled: bool,
     pub rules: Vec<GroupRule>,
-    /// 删掉的规则：成员清空前留着，清空后丢掉
+    /// 删掉的插件新建分组的规则：成员清空前留着，清空后丢掉
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupRule {
-    /// 也是宿主的 resource_key
+    /// 插件新建的分组时也是宿主的 resource_key
     pub id: String,
+    /// CPR 现有分组的 ID；没有就是插件新建的分组
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// 现有分组时是保存时 CPR 里的名称，只用来显示
     pub name: String,
     /// `#RRGGBBAA`
     pub color: String,
@@ -58,7 +77,12 @@ pub struct GroupRule {
 pub struct RuleInput {
     #[serde(default)]
     pub id: Option<String>,
+    /// 选 CPR 现有分组时填；名称和颜色以 CPR 为准
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub color: String,
     pub levels: Vec<Level>,
 }
@@ -92,6 +116,8 @@ pub struct Status {
 struct State {
     /// 每个账号的测票当前判定；不支持探测的账号不在里面
     levels: HashMap<String, Level>,
+    /// 插件新建的分组在 CPR 里的 ID，不能再被选作现有分组
+    owned_group_ids: BTreeSet<String>,
     full_ms: i64,
     status: Status,
 }
@@ -136,52 +162,107 @@ fn new_rule_id() -> Result<String, String> {
     Ok(format!("{RULE_PREFIX}{}", hex::encode(bytes)))
 }
 
-/// 校验页面提交的设置，得到新设置；删掉的规则进 `retired`
+/// 页面提交时需要的 CPR 现状
+pub struct Existing<'a> {
+    /// CPR 里的分组；只有提交里有现有分组规则时才读
+    pub groups: Option<&'a [GroupRef]>,
+    /// 不能选的分组：插件自己维护成员的那些
+    pub forbidden: &'a BTreeSet<String>,
+}
+
+/// 校验页面提交的设置，得到新设置；删掉的插件新建分组规则进 `retired`
 ///
 /// # Errors
 /// 设置不合法时返回给页面看的原因
-pub fn apply_input(current: &GroupConfig, input: ConfigInput) -> Result<GroupConfig, String> {
+pub fn apply_input(
+    current: &GroupConfig,
+    input: ConfigInput,
+    existing: &Existing<'_>,
+) -> Result<GroupConfig, String> {
     if input.rules.len() > MAX_RULES {
         return Err(format!("最多 {MAX_RULES} 个分组"));
     }
     let mut names = BTreeSet::new();
+    let mut targets = BTreeSet::new();
     let mut rules = Vec::with_capacity(input.rules.len());
     for rule in input.rules {
-        let name = rule.name.trim().to_owned();
-        if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
-            return Err("分组名需要 1 到 100 个字符".into());
-        }
-        if !names.insert(name.to_lowercase()) {
-            return Err(format!("分组名“{name}”重复"));
-        }
-        let color = normalize_color(&rule.color).ok_or("颜色格式应为 #RRGGBB")?;
         let mut levels: Vec<Level> = rule.levels;
         levels.sort();
         levels.dedup();
+        let previous = match rule.id.as_deref().filter(|id| !id.is_empty()) {
+            None => None,
+            Some(id) => Some(
+                current
+                    .rules
+                    .iter()
+                    .find(|r| r.id == id)
+                    .ok_or("规则已不存在，请刷新页面")?,
+            ),
+        };
+        let group_id = rule.group_id.filter(|g| !g.is_empty());
+        if let Some(previous) = previous
+            && previous.group_id != group_id
+        {
+            return Err(format!(
+                "分组“{}”的目标不能修改，请删掉这条规则再新建",
+                previous.name
+            ));
+        }
+        let (name, color) = if let Some(group_id) = &group_id {
+            if !valid_group_id(group_id) {
+                return Err("CPR 分组 ID 无效，请刷新页面".into());
+            }
+            if existing.forbidden.contains(group_id) {
+                return Err("这个分组由插件自己维护成员，不能再选作现有分组".into());
+            }
+            if !targets.insert(group_id.clone()) {
+                return Err("同一个 CPR 分组只能对应一条规则".into());
+            }
+            let found = existing
+                .groups
+                .and_then(|groups| groups.iter().find(|g| &g.id == group_id));
+            match (found, previous) {
+                (Some(group), _) => (
+                    group.name.clone(),
+                    normalize_color(&group.color).unwrap_or_else(|| "#6B7280FF".into()),
+                ),
+                // 已有规则的分组在 CPR 里删掉了：照常保存，同步时在规则下报错
+                (None, Some(previous)) => (previous.name.clone(), previous.color.clone()),
+                (None, None) => return Err("CPR 里没有这个分组，请刷新后重选".into()),
+            }
+        } else {
+            let name = rule.name.trim().to_owned();
+            if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
+                return Err("分组名需要 1 到 100 个字符".into());
+            }
+            if !names.insert(name.to_lowercase()) {
+                return Err(format!("分组名“{name}”重复"));
+            }
+            let color = normalize_color(&rule.color).ok_or("颜色格式应为 #RRGGBB")?;
+            // 宿主只在创建时用名称和颜色
+            if let Some(previous) = previous
+                && (previous.name != name || previous.color != color)
+            {
+                return Err(format!(
+                    "分组“{}”已创建，名称和颜色请在 CPR 的分组管理里修改",
+                    previous.name
+                ));
+            }
+            (name, color)
+        };
         if levels.is_empty() {
             return Err(format!("分组“{name}”至少要选一种判定"));
         }
-        let id = match rule.id.filter(|id| !id.is_empty()) {
+        let id = match previous {
+            Some(previous) => previous.id.clone(),
             None => new_rule_id()?,
-            Some(id) => {
-                let Some(existing) = current.rules.iter().find(|r| r.id == id) else {
-                    return Err("规则已不存在，请刷新页面".into());
-                };
-                // 宿主只在创建时用名称和颜色
-                if existing.name != name || existing.color != color {
-                    return Err(format!(
-                        "分组“{}”已创建，名称和颜色请在 CPR 的分组管理里修改",
-                        existing.name
-                    ));
-                }
-                id
-            }
         };
         if !valid_rule_id(&id) {
             return Err("规则 ID 无效，请刷新页面".into());
         }
         rules.push(GroupRule {
             id,
+            group_id,
             name,
             color,
             levels,
@@ -189,7 +270,10 @@ pub fn apply_input(current: &GroupConfig, input: ConfigInput) -> Result<GroupCon
     }
     let mut retired = current.retired.clone();
     for old in &current.rules {
-        if !rules.iter().any(|r| r.id == old.id) && !retired.contains(&old.id) {
+        if old.group_id.is_none()
+            && !rules.iter().any(|r| r.id == old.id)
+            && !retired.contains(&old.id)
+        {
             retired.push(old.id.clone());
         }
     }
@@ -236,6 +320,14 @@ impl Groups {
     #[must_use]
     pub fn status(&self) -> Status {
         lock(&self.state).status.clone()
+    }
+
+    /// 插件自己维护成员的分组（新建的分组和 ModelTrace 用的分组），不能选作现有分组
+    #[must_use]
+    pub fn plugin_group_ids(&self, runner: &Runner) -> BTreeSet<String> {
+        let mut ids = lock(&self.state).owned_group_ids.clone();
+        ids.extend(runner.probe_group_id());
+        ids
     }
 
     /// 每轮维护和保存设置后调用；`force` 时全量重读判定并同步所有账号
@@ -313,7 +405,7 @@ impl Groups {
         let mut statuses = BTreeMap::new();
         // 只有改成员失败才提前重试；建组失败（多半重名）要等用户改规则，按常规间隔重试
         let mut retry = false;
-        for rule in &config.rules {
+        for rule in config.rules.iter().filter(|r| r.group_id.is_none()) {
             let mut status = RuleStatus {
                 members: levels.values().filter(|l| rule.levels.contains(l)).count(),
                 ..RuleStatus::default()
@@ -327,6 +419,7 @@ impl Groups {
                         description: Some("账号探测插件按测票当前判定自动维护成员".into()),
                     })
                     .await?;
+                lock(&self.state).owned_group_ids.insert(group.id.clone());
                 status.group_id = group.id;
                 status.group_name = group.name;
                 let members: Vec<(&str, bool)> = targets
@@ -347,6 +440,29 @@ impl Groups {
                 status.error = Some(host_message(&error));
             }
             statuses.insert(rule.id.clone(), status);
+        }
+        let existing: Vec<&GroupRule> = config
+            .rules
+            .iter()
+            .filter(|r| r.group_id.is_some())
+            .collect();
+        if !existing.is_empty() {
+            let changed: BTreeSet<&str> = changed.iter().map(String::as_str).collect();
+            if let Err(reason) = sync_existing(
+                runner,
+                host,
+                &existing,
+                &levels,
+                (!full).then_some(&changed),
+                &mut statuses,
+            )
+            .await
+            {
+                retry = true;
+                for rule in &existing {
+                    statuses.entry(rule.id.clone()).or_default().error = Some(reason.clone());
+                }
+            }
         }
         let mut state = lock(&self.state);
         // 改成员失败的，一分钟后全量重试，保证成员最终一致
@@ -399,4 +515,69 @@ impl Groups {
         }
         Ok(error)
     }
+}
+
+/// 经 CPR 管理员接口调整现有分组：读账号现在的全部分组，换掉规则管的那几个，整体写回。
+/// `only` 有值时只处理这些账号（刚测完、判定变了的），否则处理全部账号
+async fn sync_existing(
+    runner: &Runner,
+    host: &HostClient,
+    rules: &[&GroupRule],
+    levels: &HashMap<String, Level>,
+    only: Option<&BTreeSet<&str>>,
+    statuses: &mut BTreeMap<String, RuleStatus>,
+) -> Result<(), String> {
+    let admin = Admin::new(host, &runner.config)?;
+    let groups = admin.groups().await?;
+    // 分组在 CPR 里删掉了的规则不动，其余照常
+    let mut managed: Vec<(&GroupRule, &str)> = Vec::new();
+    for rule in rules {
+        let gid = rule.group_id.as_deref().unwrap_or_default();
+        let status = statuses.entry(rule.id.clone()).or_default();
+        status.group_id = gid.to_owned();
+        status.members = levels.values().filter(|l| rule.levels.contains(l)).count();
+        match groups.iter().find(|g| g.id == gid) {
+            Some(group) => {
+                status.group_name.clone_from(&group.name);
+                managed.push((rule, gid));
+            }
+            None => {
+                status.group_name.clone_from(&rule.name);
+                status.error = Some("CPR 里找不到这个分组（可能已删除），请删掉这条规则".into());
+            }
+        }
+    }
+    if managed.is_empty() {
+        return Ok(());
+    }
+    let managed_ids: BTreeSet<&str> = managed.iter().map(|(_, gid)| *gid).collect();
+    // 结果相同的账号合成一批写
+    let mut batches: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
+    for account in admin.accounts().await? {
+        if only.is_some_and(|only| !only.contains(account.id.as_str())) {
+            continue;
+        }
+        let current: BTreeSet<&str> = account.groups.iter().map(|g| g.id.as_str()).collect();
+        let level = levels.get(&account.id);
+        let mut desired: BTreeSet<&str> = current
+            .iter()
+            .copied()
+            .filter(|g| !managed_ids.contains(g))
+            .collect();
+        for (rule, gid) in &managed {
+            if level.is_some_and(|l| rule.levels.contains(l)) {
+                desired.insert(gid);
+            }
+        }
+        if desired != current {
+            batches
+                .entry(desired.into_iter().map(str::to_owned).collect())
+                .or_default()
+                .push(account.id.clone());
+        }
+    }
+    for (group_ids, account_ids) in &batches {
+        admin.set_groups(account_ids, group_ids).await?;
+    }
+    Ok(())
 }

@@ -202,3 +202,217 @@ async fn a_name_taken_in_cpr_is_reported_per_rule() {
     .await;
     assert_eq!(view["retired"], 0, "{view}");
 }
+
+const MAIN: &str = "grp_00000000000000000000000000000001";
+const BAD: &str = "grp_00000000000000000000000000000002";
+const OTHER: &str = "grp_00000000000000000000000000000003";
+
+fn admin_config() -> Value {
+    json!({"probeEnabled": true, "fingerprintSyncHours": 0,
+        "cprAdminUrl": "http://cpr.test/", "cprAdminApiKey": "admin-secret"})
+}
+
+fn cpr_host() -> FakeHost {
+    let mut host = FakeHost::new(&["acct_ok", "acct_bad", "acct_new", "acct_key"]);
+    host.accounts[3]["authentication_kind"] = json!("apikey");
+    host.cpr_admin_key = "admin-secret".into();
+    host.cpr_groups = vec![
+        json!({"id": MAIN, "name": "主力", "color": "#22C55EFF", "enabled": true}),
+        json!({"id": BAD, "name": "隔离", "color": "#EF4444FF", "enabled": true}),
+        json!({"id": OTHER, "name": "手动", "color": "#6B7280FF", "enabled": true}),
+    ];
+    host.cpr_account_groups
+        .insert("acct_ok".into(), set(&[OTHER]));
+    host.cpr_account_groups
+        .insert("acct_bad".into(), set(&[MAIN, OTHER]));
+    host.cpr_account_groups
+        .insert("acct_key".into(), set(&[MAIN]));
+    health(&mut host, "acct_ok", "ok");
+    health(&mut host, "acct_bad", "degraded");
+    host
+}
+
+fn cpr(host: &FakeHost, account: &str) -> BTreeSet<String> {
+    host.cpr_account_groups
+        .get(account)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn existing_rules() -> Value {
+    json!({"enabled": true, "rules": [
+        {"group_id": MAIN, "levels": ["ok"]},
+        {"group_id": BAD, "levels": ["suspect", "degraded"]},
+    ]})
+}
+
+#[tokio::test]
+async fn existing_cpr_groups_are_adjusted_through_the_admin_api() {
+    let mut host = cpr_host();
+    let mut peer = Peer::start(admin_config()).await;
+
+    let (status, body) = peer.api("GET", "api/groups/cpr", "", None, &mut host).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["groups"].as_array().unwrap().len(), 3);
+
+    let (status, view) = save(&mut peer, &mut host, existing_rules()).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["rules"][0]["name"], "主力", "names come from CPR");
+    assert!(view.get("admin_error").is_none_or(Value::is_null), "{view}");
+    // 只换掉规则管的分组，其他分组保留；不支持探测的账号移出
+    assert_eq!(cpr(&host, "acct_ok"), set(&[MAIN, OTHER]));
+    assert_eq!(cpr(&host, "acct_bad"), set(&[BAD, OTHER]));
+    assert_eq!(cpr(&host, "acct_key"), set(&[]));
+    assert_eq!(cpr(&host, "acct_new"), set(&[]));
+    let main = rule_id(&view, "主力");
+    assert_eq!(view["status"]["rules"][&main]["group_name"], "主力");
+    assert_eq!(view["status"]["rules"][&main]["members"], 1);
+    assert_eq!(host.cpr_writes.len(), 3, "acct_new needed no write");
+
+    // 刚测完、判定变了的账号下一轮只写它自己
+    for _ in 0..3 {
+        host.http
+            .push_back(ticket_reply(Some("gAAAAAticket-a"), None));
+        host.http
+            .push_back(ticket_reply(Some("gAAAAAticket-a"), None));
+        peer.api(
+            "POST",
+            "api/probe",
+            "",
+            Some(json!({"account_id":"acct_bad","method":"turnstate","model":"gpt-6-luna"})),
+            &mut host,
+        )
+        .await;
+    }
+    let writes = host.cpr_writes.len();
+    peer.reconcile(&mut host).await;
+    assert_eq!(cpr(&host, "acct_bad"), set(&[MAIN, OTHER]));
+    assert_eq!(
+        &host.cpr_writes[writes..],
+        &[json!({"accountIds":["acct_bad"],"groupIds":[MAIN, OTHER]})]
+    );
+
+    // 删掉现有分组的规则：不再调整，成员保持
+    let (status, view) = save(
+        &mut peer,
+        &mut host,
+        json!({"enabled": true, "rules": [
+            {"id": main, "group_id": MAIN, "levels": ["ok"]},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["retired"], 0);
+    health(&mut host, "acct_bad", "degraded");
+    save(
+        &mut peer,
+        &mut host,
+        json!({"enabled": true, "rules": [
+            {"id": main, "group_id": MAIN, "levels": ["ok"]},
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        cpr(&host, "acct_bad"),
+        set(&[OTHER]),
+        "left MAIN, BAD untouched"
+    );
+
+    // Key 不进私有状态和响应
+    let stored = serde_json::to_string(&host.state.values().collect::<Vec<_>>()).unwrap();
+    assert!(!stored.contains("admin-secret") && !view.to_string().contains("admin-secret"));
+    assert!(
+        host.cpr_admin_calls
+            .iter()
+            .all(|c| c == "GET /api/admin/account-groups/options"
+                || c == "GET /api/admin/accounts"
+                || c == "POST /api/admin/accounts/batch-update"),
+        "{:?}",
+        host.cpr_admin_calls
+    );
+}
+
+#[tokio::test]
+async fn existing_group_rules_need_a_working_admin_api() {
+    // 没配地址和 Key
+    let mut host = cpr_host();
+    let mut peer = Peer::start(enabled()).await;
+    let (status, body) = save(&mut peer, &mut host, existing_rules()).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("管理 API Key")
+    );
+    assert_eq!(
+        peer.api("GET", "api/groups/cpr", "", None, &mut host)
+            .await
+            .0,
+        409
+    );
+    assert!(host.cpr_admin_calls.is_empty());
+
+    // Key 不对：错误里不带 Key
+    let mut host = cpr_host();
+    host.cpr_admin_key = "another".into();
+    let mut peer = Peer::start(admin_config()).await;
+    let (status, body) = peer.api("GET", "api/groups/cpr", "", None, &mut host).await;
+    assert_eq!(status, 502, "{body}");
+    assert!(body.to_string().contains("无效") && !body.to_string().contains("admin-secret"));
+}
+
+#[tokio::test]
+async fn existing_group_rules_are_validated_and_a_deleted_group_is_reported() {
+    let mut host = cpr_host();
+    let mut peer = Peer::start(admin_config()).await;
+    // 插件自己新建的分组不能再选作现有分组
+    let (_, view) = save(
+        &mut peer,
+        &mut host,
+        json!({"enabled": true, "rules": [
+            {"name": "测票正常", "color": "#22C55E", "levels": ["ok"]},
+        ]}),
+    )
+    .await;
+    let owned = rule_id(&view, "测票正常");
+    let owned_group = support::plugin_group_id(&owned);
+    let (_, view) = save(&mut peer, &mut host, existing_rules()).await;
+    let main = rule_id(&view, "主力");
+    for body in [
+        json!({"enabled": true, "rules": [{"group_id": owned_group, "levels": ["ok"]}]}),
+        json!({"enabled": true, "rules": [{"group_id": MAIN, "levels": ["ok"]}, {"group_id": MAIN, "levels": ["suspect"]}]}),
+        json!({"enabled": true, "rules": [{"group_id": "grp_ffffffffffffffffffffffffffffffff", "levels": ["ok"]}]}),
+        json!({"enabled": true, "rules": [{"group_id": "not-a-group", "levels": ["ok"]}]}),
+        json!({"enabled": true, "rules": [{"id": main, "group_id": BAD, "levels": ["ok"]}]}),
+        json!({"enabled": true, "rules": [{"id": main, "name": "主力", "color": "#22C55E", "levels": ["ok"]}]}),
+    ] {
+        let (status, body) = save(&mut peer, &mut host, body.clone()).await;
+        assert_eq!(status, 400, "{body}");
+    }
+
+    // 现有分组在 CPR 里被删掉：仍能保存，那条规则报错，其他规则照常
+    let bad = rule_id(&view, "隔离");
+    host.cpr_groups.retain(|g| g["id"] != BAD);
+    host.cpr_account_groups
+        .insert("acct_bad".into(), set(&[OTHER]));
+    let (status, view) = save(
+        &mut peer,
+        &mut host,
+        json!({"enabled": true, "rules": [
+            {"id": main, "group_id": MAIN, "levels": ["ok", "degraded"]},
+            {"id": bad, "group_id": BAD, "levels": ["suspect", "degraded"]},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert!(
+        view["status"]["rules"][&bad]["error"]
+            .as_str()
+            .unwrap()
+            .contains("找不到")
+    );
+    assert!(view["status"]["rules"][&main].get("error").is_none());
+    assert_eq!(cpr(&host, "acct_bad"), set(&[MAIN, OTHER]));
+    assert!(host.cpr_account_groups.values().all(|g| !g.contains(BAD)));
+}

@@ -61,8 +61,22 @@ pub struct FakeHost {
     pub groups: BTreeMap<String, (String, BTreeSet<String>)>,
     /// CPR 里管理员已有的分组名
     pub taken_group_names: Vec<String>,
+    /// 假的 CPR 管理接口（`http://cpr.test`）：分组、账号所在分组、管理 API Key、收到的写入
+    pub cpr_groups: Vec<Value>,
+    pub cpr_account_groups: BTreeMap<String, BTreeSet<String>>,
+    pub cpr_admin_key: String,
+    pub cpr_writes: Vec<Value>,
+    pub cpr_admin_calls: Vec<String>,
     streams: HashMap<String, Vec<u8>>,
     next_version: u64,
+}
+
+/// 假宿主给插件分组的 CPR 分组 ID（和真的一样是 `grp_` 加 32 位十六进制）
+pub fn plugin_group_id(resource_key: &str) -> String {
+    let hash = resource_key.bytes().fold(7_u128, |h, b| {
+        h.wrapping_mul(131).wrapping_add(u128::from(b))
+    });
+    format!("grp_{hash:032x}")
 }
 
 pub fn account(id: &str) -> Value {
@@ -118,6 +132,95 @@ impl FakeHost {
         self.state
             .get(&(namespace.to_owned(), key.to_owned()))
             .map(|(v, _)| v)
+    }
+
+    fn cpr_group(&self, id: &str) -> Option<Value> {
+        self.cpr_groups.iter().find(|g| g["id"] == id).cloned()
+    }
+
+    fn cpr_admin(&mut self, params: &Value, payload: &[u8]) -> (u16, Value) {
+        let method = params["method"].as_str().unwrap().to_owned();
+        let url = params["url"].as_str().unwrap();
+        let path = url
+            .trim_start_matches("http://cpr.test")
+            .split('?')
+            .next()
+            .unwrap()
+            .to_owned();
+        self.cpr_admin_calls.push(format!("{method} {path}"));
+        let key = params["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h[0] == "x-api-key")
+            .map(|h| {
+                let bytes: Vec<u8> = serde_json::from_value(h[1].clone()).unwrap();
+                String::from_utf8(bytes).unwrap()
+            });
+        if key.as_deref() != Some(self.cpr_admin_key.as_str()) || self.cpr_admin_key.is_empty() {
+            return (
+                401,
+                json!({"code":401,"message":"invalid admin api key","data":null}),
+            );
+        }
+        let ok = |data: Value| (200, json!({"code":200,"message":"ok","data":data}));
+        match (method.as_str(), path.as_str()) {
+            ("GET", "/api/admin/account-groups/options") => ok(
+                json!({"items": self.cpr_groups, "page": {"totalPages": 1}, "configRevision": 1}),
+            ),
+            ("GET", "/api/admin/accounts") => {
+                assert!(url.contains("provider=openai"));
+                let items: Vec<Value> = self
+                    .accounts
+                    .iter()
+                    .map(|a| {
+                        let id = a["account_id"].as_str().unwrap();
+                        let groups: Vec<Value> = self
+                            .cpr_account_groups
+                            .get(id)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|g| self.cpr_group(g))
+                            .collect();
+                        json!({"id": id, "name": a["name"], "provider": "openai", "groups": groups})
+                    })
+                    .collect();
+                ok(json!({"items": items, "page": {"totalPages": 1}}))
+            }
+            ("POST", "/api/admin/accounts/batch-update") => {
+                let body: Value = serde_json::from_slice(payload).unwrap();
+                let keys: BTreeSet<&str> = body
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(
+                    keys,
+                    BTreeSet::from(["accountIds", "groupIds"]),
+                    "only groups are written"
+                );
+                self.cpr_writes.push(body.clone());
+                let groups: BTreeSet<String> = body["groupIds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|g| g.as_str().unwrap().to_owned())
+                    .collect();
+                if groups.iter().any(|g| self.cpr_group(g).is_none()) {
+                    return (
+                        404,
+                        json!({"code":404,"message":"account group not found","data":null}),
+                    );
+                }
+                for id in body["accountIds"].as_array().unwrap() {
+                    self.cpr_account_groups
+                        .insert(id.as_str().unwrap().to_owned(), groups.clone());
+                }
+                ok(json!({"accountIds": body["accountIds"], "configRevision": 2}))
+            }
+            _ => panic!("plugin called an unexpected CPR admin route: {method} {path}"),
+        }
     }
 
     fn find(&self, payload: &[u8]) -> Result<Value, PluginFault> {
@@ -218,7 +321,7 @@ impl FakeHost {
                 Ok((
                     json!({}),
                     serde_json::to_vec(
-                        &json!({"id":format!("grp-{key}"),"name":name,"enabled":true}),
+                        &json!({"id":plugin_group_id(&key),"name":name,"enabled":true}),
                     )
                     .unwrap(),
                 ))
@@ -279,6 +382,20 @@ impl FakeHost {
                     })
                 });
                 Ok((json!({"Ok":profile}), Vec::new()))
+            }
+            "host.http.do_stream"
+                if params["url"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("http://cpr.test/")) =>
+            {
+                let (status, body) = self.cpr_admin(params, payload);
+                let id = format!("cpr-stream-{}", self.cpr_admin_calls.len());
+                self.streams
+                    .insert(id.clone(), serde_json::to_vec(&body).unwrap());
+                Ok((
+                    json!({"status":status,"http_version":"HTTP/1.1","headers":[],"stream":id,"trailers":[]}),
+                    Vec::new(),
+                ))
             }
             "host.http.do_stream" => {
                 self.seen_public_http.push(params.clone());

@@ -1,5 +1,6 @@
 //! CPR 插件“账号探测”：ModelTrace 指纹与测票，主动探测 OpenAI OAuth 账号是否被降智
 
+mod admin;
 pub mod bank_sync;
 pub mod clock;
 pub mod codex;
