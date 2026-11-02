@@ -179,6 +179,13 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
 
 async fn groups_view(app: &App, host: &HostClient) -> Result<Value, ApiError> {
     let (config, _) = store::group_config(host).await?;
+    // 页面的账号类型选项：CPR 里可探测账号现有的套餐
+    let plans: std::collections::BTreeSet<String> = host::openai_accounts(host)
+        .await?
+        .iter()
+        .filter(|a| supported(a))
+        .map(crate::groups::plan_of)
+        .collect();
     Ok(json!({
         "enabled": config.enabled,
         "rules": config.rules,
@@ -186,6 +193,7 @@ async fn groups_view(app: &App, host: &HostClient) -> Result<Value, ApiError> {
         "max_rules": crate::groups::MAX_RULES,
         "status": app.groups.status(),
         "admin_error": crate::admin::base_url(&app.runner.config).err(),
+        "plans": plans,
     }))
 }
 

@@ -17,6 +17,13 @@ const colors = [
   { label: '紫', value: '#8B5CF6FF' },
   { label: '灰', value: '#6B7280FF' },
 ]
+// 常见的 ChatGPT 套餐；再加上 CPR 里账号现有的
+const commonPlans = ['free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu']
+const planOptions = computed(() => [...new Set([...commonPlans, ...(view.value?.plans ?? []), ...rules.value.flatMap(r => r.plans ?? [])])]
+  .sort((a, b) => (a === 'unknown' ? 1 : 0) - (b === 'unknown' ? 1 : 0) || commonPlans.indexOf(a) - commonPlans.indexOf(b) || a.localeCompare(b)))
+function planLabel(plan: string) {
+  return plan === 'unknown' ? '未知' : plan.toUpperCase()
+}
 const kinds = [{ label: '插件新建分组', value: 'owned' }, { label: 'CPR 现有分组', value: 'existing' }]
 // 没配过时给一份建议，保存后才生效
 const suggested = (): GroupRule[] => [
@@ -82,6 +89,10 @@ watch(open, value => { if (value) load() })
 function toggle(rule: GroupRule, level: Level, on: boolean) {
   rule.levels = on ? [...new Set([...rule.levels, level])] : rule.levels.filter(l => l !== level)
 }
+function togglePlan(rule: GroupRule, plan: string, on: boolean) {
+  const plans = rule.plans ?? []
+  rule.plans = on ? [...new Set([...plans, plan])] : plans.filter(p => p !== plan)
+}
 function add() {
   rules.value.push({ name: '', color: '#3B82F6FF', levels: [] })
 }
@@ -96,8 +107,8 @@ async function save() {
   saving.value = true
   try {
     const body = rules.value.map(r => r.group_id === undefined
-      ? { id: r.id, name: r.name.trim(), color: r.color, levels: r.levels }
-      : { id: r.id, group_id: r.group_id, name: r.name, color: r.color, levels: r.levels })
+      ? { id: r.id, name: r.name.trim(), color: r.color, levels: r.levels, plans: r.plans ?? [] }
+      : { id: r.id, group_id: r.group_id, name: r.name, color: r.color, levels: r.levels, plans: r.plans ?? [] })
     fill(await api.saveGroups(enabled.value, body))
     notice.value = enabled.value ? '已保存，并按当前测票判定同步了分组' : '已保存；自动分组关闭，分组成员保持不变'
   }
@@ -137,6 +148,11 @@ async function save() {
           <span class="text-cp-xs text-cp-text-secondary">判定为</span>
           <ZCheckbox v-for="l in levels" :key="l" :model-value="rule.levels.includes(l)" :label="levelLabel[l]" :disabled="saving" @update:model-value="(on: boolean) => toggle(rule, l, on)" />
           <span class="text-cp-xs text-cp-text-tertiary">的账号进这个组</span>
+        </div>
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="text-cp-xs text-cp-text-secondary">账号类型</span>
+          <ZCheckbox v-for="p in planOptions" :key="p" :model-value="(rule.plans ?? []).includes(p)" :label="planLabel(p)" :disabled="saving" @update:model-value="(on: boolean) => togglePlan(rule, p, on)" />
+          <span class="text-cp-xs text-cp-text-tertiary">{{ rule.plans?.length ? '两个条件都符合才进组' : '不选表示全部类型' }}</span>
         </div>
         <p v-if="rule.id && view?.status.rules[rule.id]" class="m-0 text-cp-xs" :class="view.status.rules[rule.id]!.error ? 'text-cp-warning-text' : 'text-cp-text-tertiary'">
           <template v-if="view.status.rules[rule.id]!.error">{{ view.status.rules[rule.id]!.error }}</template>

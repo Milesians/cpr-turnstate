@@ -416,3 +416,73 @@ async fn existing_group_rules_are_validated_and_a_deleted_group_is_reported() {
     assert_eq!(cpr(&host, "acct_bad"), set(&[MAIN, OTHER]));
     assert!(host.cpr_account_groups.values().all(|g| !g.contains(BAD)));
 }
+
+#[tokio::test]
+async fn rules_can_filter_by_account_type() {
+    let mut host = cpr_host();
+    host.accounts[0]["plan_type"] = json!("Team");
+    host.accounts[1]["plan_type"] = json!("pro");
+    host.accounts[2]["plan_type"] = json!(null);
+    health(&mut host, "acct_bad", "ok");
+    health(&mut host, "acct_new", "ok");
+    let mut peer = Peer::start(admin_config()).await;
+
+    let (_, view) = peer.api("GET", "api/groups", "", None, &mut host).await;
+    assert_eq!(
+        view["plans"],
+        json!(["pro", "team", "unknown"]),
+        "only accounts that can be probed"
+    );
+
+    let (status, view) = save(
+        &mut peer,
+        &mut host,
+        json!({"enabled": true, "rules": [
+            {"name": "Team 正常", "color": "#22C55E", "levels": ["ok"], "plans": ["team"]},
+            {"group_id": MAIN, "levels": ["ok"], "plans": ["PRO", "unknown", "pro"]},
+            {"name": "全部正常", "color": "#3B82F6", "levels": ["ok"]},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(
+        view["rules"][1]["plans"],
+        json!(["pro", "unknown"]),
+        "normalized"
+    );
+    assert!(
+        view["rules"][2].get("plans").is_none(),
+        "no filter means every type"
+    );
+    let team = rule_id(&view, "Team 正常");
+    let all = rule_id(&view, "全部正常");
+    assert_eq!(members(&host, &team), set(&["acct_ok"]));
+    assert_eq!(
+        members(&host, &all),
+        set(&["acct_ok", "acct_bad", "acct_new"])
+    );
+    assert_eq!(view["status"]["rules"][&team]["members"], 1);
+    assert_eq!(
+        cpr(&host, "acct_ok"),
+        set(&[OTHER]),
+        "team is not pro/unknown"
+    );
+    assert_eq!(cpr(&host, "acct_bad"), set(&[MAIN, OTHER]));
+    assert_eq!(cpr(&host, "acct_new"), set(&[MAIN]));
+
+    for plans in [
+        json!(["bad plan"]),
+        json!(["x".repeat(33)]),
+        json!((0..17).map(|i| format!("p{i}")).collect::<Vec<_>>()),
+    ] {
+        let (status, body) = save(
+            &mut peer,
+            &mut host,
+            json!({"enabled": true, "rules": [
+                {"name": "x", "color": "#22C55E", "levels": ["ok"], "plans": plans},
+            ]}),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+    }
+}

@@ -264,6 +264,8 @@ export interface GroupRule {
   name: string
   color: string
   levels: Level[]
+  /** 账号类型（套餐，小写；没有套餐是 unknown）；不填表示不限 */
+  plans?: string[]
 }
 
 export interface GroupRuleStatus {
@@ -282,6 +284,8 @@ export interface GroupsView {
   status: { synced_ms: number, error?: string, rules: Record<string, GroupRuleStatus> }
   /** 没配好 CPR 地址或管理 API Key 时的原因；为空表示可以选现有分组 */
   admin_error?: string | null
+  /** CPR 里可探测账号现有的账号类型 */
+  plans: string[]
 }
 
 export interface CprGroup {

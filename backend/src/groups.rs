@@ -69,6 +69,37 @@ pub struct GroupRule {
     pub color: String,
     /// 当前测票判定在其中的账号进这个组；`unknown` 是还没有确认过的判定
     pub levels: Vec<Level>,
+    /// 账号类型（CPR 给的套餐，小写，没有套餐是 `unknown`）；空表示不限（用户 2026-11-02）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plans: Vec<String>,
+}
+
+impl GroupRule {
+    /// 判定和账号类型都符合才进组
+    fn admits(&self, level: Option<&Level>, plan: Option<&str>) -> bool {
+        level.is_some_and(|l| self.levels.contains(l))
+            && (self.plans.is_empty() || plan.is_some_and(|p| self.plans.iter().any(|x| x == p)))
+    }
+}
+
+/// 账号类型：CPR 给的套餐，小写；没有就是 `unknown`
+#[must_use]
+pub fn plan_of(account: &AuthRuntimeAccount) -> String {
+    account
+        .plan_type
+        .as_deref()
+        .map(|p| p.trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+const MAX_PLANS: usize = 16;
+
+fn valid_plan(plan: &str) -> bool {
+    (1..=32).contains(&plan.len())
+        && plan
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
 }
 
 /// 页面提交的规则；新规则不带 id
@@ -85,6 +116,9 @@ pub struct RuleInput {
     #[serde(default)]
     pub color: String,
     pub levels: Vec<Level>,
+    /// 不填或为空表示不限账号类型
+    #[serde(default)]
+    pub plans: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -189,6 +223,12 @@ pub fn apply_input(
         let mut levels: Vec<Level> = rule.levels;
         levels.sort();
         levels.dedup();
+        let mut plans: Vec<String> = rule.plans.iter().map(|p| p.trim().to_lowercase()).collect();
+        plans.sort();
+        plans.dedup();
+        if plans.len() > MAX_PLANS || !plans.iter().all(|p| valid_plan(p)) {
+            return Err("账号类型无效".into());
+        }
         let previous = match rule.id.as_deref().filter(|id| !id.is_empty()) {
             None => None,
             Some(id) => Some(
@@ -266,6 +306,7 @@ pub fn apply_input(
             name,
             color,
             levels,
+            plans,
         });
     }
     let mut retired = current.retired.clone();
@@ -395,6 +436,10 @@ impl Groups {
             return Ok(());
         }
         let levels = lock(&self.state).levels.clone();
+        let plans: HashMap<String, String> = accounts
+            .iter()
+            .map(|a| (a.account_id.clone(), plan_of(a)))
+            .collect();
         // 全量时同步所有账号（不支持探测的移出），否则只同步判定变了的账号
         let targets: Vec<&str> = if full {
             ids.clone()
@@ -407,7 +452,12 @@ impl Groups {
         let mut retry = false;
         for rule in config.rules.iter().filter(|r| r.group_id.is_none()) {
             let mut status = RuleStatus {
-                members: levels.values().filter(|l| rule.levels.contains(l)).count(),
+                members: levels
+                    .iter()
+                    .filter(|(id, l)| {
+                        rule.admits(Some(l), plans.get(id.as_str()).map(String::as_str))
+                    })
+                    .count(),
                 ..RuleStatus::default()
             };
             let result = async {
@@ -427,7 +477,7 @@ impl Groups {
                     .map(|id| {
                         (
                             *id,
-                            levels.get(*id).is_some_and(|l| rule.levels.contains(l)),
+                            rule.admits(levels.get(*id), plans.get(*id).map(String::as_str)),
                         )
                     })
                     .collect();
@@ -453,6 +503,7 @@ impl Groups {
                 host,
                 &existing,
                 &levels,
+                &plans,
                 (!full).then_some(&changed),
                 &mut statuses,
             )
@@ -524,6 +575,7 @@ async fn sync_existing(
     host: &HostClient,
     rules: &[&GroupRule],
     levels: &HashMap<String, Level>,
+    plans: &HashMap<String, String>,
     only: Option<&BTreeSet<&str>>,
     statuses: &mut BTreeMap<String, RuleStatus>,
 ) -> Result<(), String> {
@@ -535,7 +587,10 @@ async fn sync_existing(
         let gid = rule.group_id.as_deref().unwrap_or_default();
         let status = statuses.entry(rule.id.clone()).or_default();
         status.group_id = gid.to_owned();
-        status.members = levels.values().filter(|l| rule.levels.contains(l)).count();
+        status.members = levels
+            .iter()
+            .filter(|(id, l)| rule.admits(Some(l), plans.get(id.as_str()).map(String::as_str)))
+            .count();
         match groups.iter().find(|g| g.id == gid) {
             Some(group) => {
                 status.group_name.clone_from(&group.name);
@@ -559,13 +614,14 @@ async fn sync_existing(
         }
         let current: BTreeSet<&str> = account.groups.iter().map(|g| g.id.as_str()).collect();
         let level = levels.get(&account.id);
+        let plan = plans.get(&account.id).map(String::as_str);
         let mut desired: BTreeSet<&str> = current
             .iter()
             .copied()
             .filter(|g| !managed_ids.contains(g))
             .collect();
         for (rule, gid) in &managed {
-            if level.is_some_and(|l| rule.levels.contains(l)) {
+            if rule.admits(level, plan) {
                 desired.insert(gid);
             }
         }
