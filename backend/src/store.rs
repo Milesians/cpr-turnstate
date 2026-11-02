@@ -22,6 +22,7 @@ use crate::verdict::{Level, UpstreamError, Verdict};
 
 const SETTINGS: &str = "settings";
 const SCHEDULES: &str = "schedules";
+const GROUPS: &str = "groups";
 const HISTORY: &str = "history";
 const RUNS: &str = "runs";
 
@@ -330,6 +331,47 @@ pub async fn schedules(host: &HostClient) -> Result<(Schedules, Option<u64>), Pl
         }
     }
     Ok((schedules, version))
+}
+
+/// 读自动分组设置和它的版本
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn group_config(
+    host: &HostClient,
+) -> Result<(crate::groups::GroupConfig, Option<u64>), PluginFault> {
+    Ok(match host::state_get(host, SETTINGS, GROUPS).await? {
+        Some(record) => (
+            serde_json::from_value(record.value).unwrap_or_default(),
+            Some(record.version),
+        ),
+        None => (crate::groups::GroupConfig::default(), None),
+    })
+}
+
+/// 改自动分组设置；`change` 拒绝时不写入，并发修改时重读再改
+///
+/// # Errors
+/// 回调失败或一直冲突时返回错误
+pub async fn update_group_config(
+    host: &HostClient,
+    mut change: impl FnMut(&mut crate::groups::GroupConfig) -> Result<(), String>,
+) -> Result<Result<(), String>, PluginFault> {
+    for _ in 0..5 {
+        let (mut config, version) = group_config(host).await?;
+        if let Err(reason) = change(&mut config) {
+            return Ok(Err(reason));
+        }
+        match host::state_put(host, SETTINGS, GROUPS, encode(&config)?, version).await {
+            Ok(_) => return Ok(Ok(())),
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "设置被同时修改，请重试",
+    ))
 }
 
 /// 改一个账号一种方法的设置；并发修改时重读再改

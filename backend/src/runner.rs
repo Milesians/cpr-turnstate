@@ -5,7 +5,7 @@
 //! - ModelTrace 经 `host.model.execute` 走 CPR 自己的模型链，指定账号，用插件自己维护的
 //!   Client Key（计入它的用量）
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,8 @@ pub struct Runner {
     busy: Mutex<HashMap<String, (String, i64)>>,
     /// ModelTrace 用的 Client Key ID
     key: Mutex<Option<String>>,
+    /// 测完测票、当前判定可能变了的账号；自动分组取走后只重读这些
+    turnstate_finished: Mutex<HashSet<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -105,7 +107,13 @@ impl Runner {
             bank: BankStore::default(),
             busy: Mutex::new(HashMap::new()),
             key: Mutex::new(None),
+            turnstate_finished: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// 取走上次以来测完测票的账号
+    pub fn take_turnstate_finished(&self) -> HashSet<String> {
+        std::mem::take(&mut *lock(&self.turnstate_finished))
     }
 
     /// 账号正在运行的记录
@@ -321,6 +329,7 @@ impl Runner {
                         self.config.telegram_enabled,
                     )
                     .await?;
+                    lock(&self.turnstate_finished).insert(account.account_id.clone());
                     crate::telegram::dispatch(host, &self.config, account).await;
                 }
                 Method::Modeltrace => {

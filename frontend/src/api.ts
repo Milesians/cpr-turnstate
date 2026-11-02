@@ -256,6 +256,30 @@ async function call<T>(method: 'GET' | 'POST', path: string, query?: Record<stri
   return value as T
 }
 
+export interface GroupRule {
+  /** 新规则没有 id；保存后由插件分配，也是 CPR 里的资源键 */
+  id?: string
+  name: string
+  color: string
+  levels: Level[]
+}
+
+export interface GroupRuleStatus {
+  group_id: string
+  group_name: string
+  members: number
+  error?: string
+}
+
+export interface GroupsView {
+  enabled: boolean
+  rules: GroupRule[]
+  /** 已删除、成员还没清空的规则数 */
+  retired: number
+  max_rules: number
+  status: { synced_ms: number, error?: string, rules: Record<string, GroupRuleStatus> }
+}
+
 export const api = {
   overview: (hours = 24) => call<Overview>('GET', 'api/overview', { hours: String(hours) }),
   account: (id: string) => call<AccountDetail>('GET', 'api/account', { id }),
@@ -268,6 +292,8 @@ export const api = {
   batchSchedule: (account_ids: string[], method: Method, patch: SchedulePatch) => call<{ updated: number }>('POST', 'api/schedules/batch', undefined, { account_ids, method, ...patch }),
   syncBank: () => call<{ bank: BankInfo }>('POST', 'api/fingerprint/sync', undefined, {}),
   testTelegram: () => call<{ sent: boolean }>('POST', 'api/telegram/test', undefined, {}),
+  groups: () => call<GroupsView>('GET', 'api/groups'),
+  saveGroups: (enabled: boolean, rules: GroupRule[]) => call<GroupsView>('POST', 'api/groups', undefined, { enabled, rules }),
 }
 
 /** 发起一次探测；ModelTrace 由页面逐题推进，直到完成 */

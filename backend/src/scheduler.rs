@@ -73,7 +73,12 @@ impl Scheduler {
     ///
     /// # Errors
     /// 读账号或设置失败时返回错误，宿主 5 秒后重试
-    pub async fn reconcile(&self, runner: &Runner, host: &HostClient) -> Result<(), PluginFault> {
+    pub async fn reconcile(
+        &self,
+        runner: &Runner,
+        groups: &crate::groups::Groups,
+        host: &HostClient,
+    ) -> Result<(), PluginFault> {
         runner
             .bank
             .sync_if_due(host, runner.config.fingerprint_sync_hours)
@@ -101,6 +106,16 @@ impl Scheduler {
             runner.abandon(host, &account_id, &run_id).await?;
         }
         self.recover(runner, host, &accounts).await?;
+        // 分组按上一轮及手动测完的结果调整；不发探测，不受“发出真实探测”开关影响
+        if let Err(error) = groups.sync(runner, host, &accounts, false).await {
+            host::log(
+                host,
+                "group_sync_failed",
+                LogLevel::Warn,
+                json!({"code": format!("{:?}", error.code)}),
+            )
+            .await;
+        }
         if !runner.config.probe_enabled {
             return Ok(());
         }

@@ -1,6 +1,6 @@
 //! 经公开 RPC 会话驱动插件，模拟宿主回调：私有状态、账号、受管 HTTP 与模型调用
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
 use cpr_account_probe::{PLUGIN_ID, manifest, serve};
@@ -57,6 +57,10 @@ pub struct FakeHost {
     pub public_http: VecDeque<HttpReply>,
     pub seen_public_http: Vec<Value>,
     pub seen_public_bodies: Vec<Value>,
+    /// 插件自有分组：resource_key → (名称, 成员)
+    pub groups: BTreeMap<String, (String, BTreeSet<String>)>,
+    /// CPR 里管理员已有的分组名
+    pub taken_group_names: Vec<String>,
     streams: HashMap<String, Vec<u8>>,
     next_version: u64,
 }
@@ -193,11 +197,32 @@ impl FakeHost {
                 let deleted = self.state.remove(&key).is_some();
                 Ok((json!({"deleted": deleted}), Vec::new()))
             }
-            "host.groups.ensure" => Ok((
-                json!({}),
-                serde_json::to_vec(&json!({"id":"group-1","name":"账号探测","enabled":true}))
+            "host.groups.ensure" => {
+                let req: Value = serde_json::from_slice(payload).unwrap();
+                let key = req["resource_key"].as_str().unwrap().to_owned();
+                let name = req["name"].as_str().unwrap().to_owned();
+                assert!(req["color"].as_str().unwrap().len() == 9);
+                if !self.groups.contains_key(&key) {
+                    let lower = name.to_lowercase();
+                    if self
+                        .taken_group_names
+                        .iter()
+                        .any(|n| n.to_lowercase() == lower)
+                        || self.groups.values().any(|(n, _)| n.to_lowercase() == lower)
+                    {
+                        return Err(PluginFault::new(ErrorCode::Conflict, "duplicate name"));
+                    }
+                    self.groups.insert(key.clone(), (name, BTreeSet::new()));
+                }
+                let (name, _) = &self.groups[&key];
+                Ok((
+                    json!({}),
+                    serde_json::to_vec(
+                        &json!({"id":format!("grp-{key}"),"name":name,"enabled":true}),
+                    )
                     .unwrap(),
-            )),
+                ))
+            }
             "host.keys.ensure" => Ok((
                 json!({}),
                 serde_json::to_vec(
@@ -207,10 +232,39 @@ impl FakeHost {
             )),
             "host.groups.change_members" => {
                 let req: Value = serde_json::from_slice(payload).unwrap();
-                assert_eq!(req["resource_key"], "probe");
+                let key = req["resource_key"].as_str().unwrap().to_owned();
+                let ids = |field: &str| -> BTreeSet<String> {
+                    req[field]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_owned())
+                        .collect()
+                };
+                let (add, remove) = (ids("add"), ids("remove"));
+                assert!(add.len() + remove.len() <= 200 && add.is_disjoint(&remove));
+                if key == "probe" {
+                    return Ok((
+                        json!({}),
+                        serde_json::to_vec(&json!({"added": 0, "removed": 0})).unwrap(),
+                    ));
+                }
+                // 宿主：资源不存在报冲突
+                let Some((_, members)) = self.groups.get_mut(&key) else {
+                    return Err(PluginFault::new(
+                        ErrorCode::Conflict,
+                        "authorization changed",
+                    ));
+                };
+                let before = members.len();
+                members.extend(add);
+                let added = members.len() - before;
+                let before = members.len();
+                members.retain(|m| !remove.contains(m));
+                let removed = before - members.len();
                 Ok((
                     json!({}),
-                    serde_json::to_vec(&json!({"added": 0, "removed": 0})).unwrap(),
+                    serde_json::to_vec(&json!({"added": added, "removed": removed})).unwrap(),
                 ))
             }
             "host.services.call" => {

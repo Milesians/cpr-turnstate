@@ -52,6 +52,8 @@ pub fn registration() -> ManagementRegistration {
             route("POST", "api/schedules/batch"),
             route("POST", "api/fingerprint/sync"),
             route("POST", "api/telegram/test"),
+            route("GET", "api/groups"),
+            route("POST", "api/groups"),
         ],
         resources: ["web/index.html", "web/app.js", "web/app.css"]
             .into_iter()
@@ -167,8 +169,38 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
             .map_err(|e| ApiError::new(502, "telegram_failed", e.message))?;
             Ok(json!({"sent": true}))
         }
+        ("GET", "api/groups") => groups_view(app, host).await,
+        ("POST", "api/groups") => save_groups(app, host, decode(call)?).await,
         _ => Err(ApiError::new(404, "not_found", "没有这个接口")),
     }
+}
+
+async fn groups_view(app: &App, host: &HostClient) -> Result<Value, ApiError> {
+    let (config, _) = store::group_config(host).await?;
+    Ok(json!({
+        "enabled": config.enabled,
+        "rules": config.rules,
+        "retired": config.retired.len(),
+        "max_rules": crate::groups::MAX_RULES,
+        "status": app.groups.status(),
+    }))
+}
+
+async fn save_groups(
+    app: &App,
+    host: &HostClient,
+    input: crate::groups::ConfigInput,
+) -> Result<Value, ApiError> {
+    store::update_group_config(host, |config| {
+        *config = crate::groups::apply_input(config, input.clone())?;
+        Ok(())
+    })
+    .await?
+    .map_err(ApiError::invalid)?;
+    // 保存后马上全量同步一次；失败记在状态里，不影响保存
+    let accounts = host::openai_accounts(host).await?;
+    let _ = app.groups.sync(&app.runner, host, &accounts, true).await;
+    groups_view(app, host).await
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {

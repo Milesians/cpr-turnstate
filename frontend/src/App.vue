@@ -2,11 +2,12 @@
 import type { Method, Models, Overview, OverviewAccount } from './api'
 import { ZButton, ZCheckbox, ZConfigProvider, ZEmpty, ZInput, ZSegmented, ZTag } from '@codex-proxy/ui'
 import { zhHans } from '@codex-proxy/ui/locale'
-import { Activity, RefreshCw, Search, Settings2 } from '@lucide/vue'
+import { Activity, FolderSync, RefreshCw, Search, Settings2 } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 import { api, methodLabel, scheduledMethods } from './api'
 import AccountDetail from './components/AccountDetail.vue'
 import BatchConfigDialog from './components/BatchConfigDialog.vue'
+import GroupsDialog from './components/GroupsDialog.vue'
 import ProbeDialog from './components/ProbeDialog.vue'
 import ProbeStrip from './components/ProbeStrip.vue'
 import { dateTime, rate } from './format'
@@ -25,6 +26,7 @@ const hours = ref('24')
 const search = ref('')
 const selectedIds = ref<string[]>([])
 const batchOpen = ref(false)
+const groupsOpen = ref(false)
 const notice = ref('')
 const selectable = computed(() => accounts.value.filter(a => a.supported).map(a => a.id))
 const allSelected = computed({
@@ -125,6 +127,7 @@ onMounted(() => Promise.all([load(), loadModels()]))
           </div>
           <div class="flex items-center gap-2">
             <ZTag :type="overview?.config.probe_enabled ? 'success' : 'default'" size="small">{{ overview?.config.probe_enabled ? '真实探测已开启' : '真实探测未开启' }}</ZTag>
+            <ZButton size="small" aria-label="自动分组设置" @click="groupsOpen = true"><FolderSync :size="14" aria-hidden="true" /> 自动分组</ZButton>
             <ZButton size="small" :loading="loading" aria-label="刷新账号" @click="load"><RefreshCw :size="14" aria-hidden="true" /> 刷新</ZButton>
           </div>
         </header>
@@ -192,6 +195,7 @@ onMounted(() => Promise.all([load(), loadModels()]))
           <button type="button" class="sync-link" :disabled="syncing" @click="syncBank"><RefreshCw :size="12" :class="{ 'animate-spin': syncing }" aria-hidden="true" />{{ syncing ? '同步中…' : '同步指纹库' }}</button>
           <span v-if="overview?.bank.error" class="w-full text-cp-warning-text">{{ overview.bank.error }}</span>
         </footer>
+        <GroupsDialog v-model="groupsOpen" />
         <BatchConfigDialog v-model="batchOpen" :account-ids="selectedIds" :models="models" @done="batchDone" />
         <ProbeDialog v-if="dialogAccount" v-model="dialog" :account-id="dialogAccount.id" :account-name="dialogAccount.email || dialogAccount.name" method="turnstate" :saved-models="{ turnstate: dialogAccount.methods.turnstate.schedule.model, modeltrace: dialogAccount.methods.modeltrace.schedule.model }" :models="models" @done="load" />
       </template>

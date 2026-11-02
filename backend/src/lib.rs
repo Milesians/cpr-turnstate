@@ -5,6 +5,7 @@ pub mod clock;
 pub mod codex;
 pub mod config;
 pub mod fingerprint;
+pub mod groups;
 pub mod health;
 mod host;
 mod management;
@@ -41,6 +42,7 @@ pub fn manifest() -> Result<Manifest, ManifestError> {
 pub struct App {
     runner: runner::Runner,
     scheduler: scheduler::Scheduler,
+    groups: groups::Groups,
 }
 
 /// 组装处理器
@@ -51,6 +53,7 @@ pub fn plugin(config: config::Config) -> Result<ComposedPlugin, AuthorError> {
     let app = Arc::new(App {
         runner: runner::Runner::new(config),
         scheduler: scheduler::Scheduler::default(),
+        groups: groups::Groups::default(),
     });
     let management_app = Arc::clone(&app);
     let maintenance_app = Arc::clone(&app);
@@ -62,7 +65,9 @@ pub fn plugin(config: config::Config) -> Result<ComposedPlugin, AuthorError> {
         .on(methods::RECONCILE, move |call| {
             let app = Arc::clone(&maintenance_app);
             async move {
-                app.scheduler.reconcile(&app.runner, &call.host).await?;
+                app.scheduler
+                    .reconcile(&app.runner, &app.groups, &call.host)
+                    .await?;
                 Ok(gateway_plugin_sdk::client::TypedReply::new(
                     gateway_plugin_sdk::client::Empty {},
                 ))
