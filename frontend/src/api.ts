@@ -271,21 +271,28 @@ export interface GroupRule {
 export interface GroupRuleStatus {
   group_id: string
   group_name: string
-  members: number
   error?: string
 }
 
 export interface GroupsView {
   enabled: boolean
   rules: GroupRule[]
-  /** 已删除、成员还没清空的规则数 */
-  retired: number
   max_rules: number
-  status: { synced_ms: number, error?: string, rules: Record<string, GroupRuleStatus> }
+  status: { synced_ms: number, error?: string, rules: Record<string, GroupRuleStatus>, changes: GroupChange[] }
   /** 没配好 CPR 地址或管理 API Key 时的原因；为空表示可以选现有分组 */
   admin_error?: string | null
   /** CPR 里可探测账号现有的账号类型 */
   plans: string[]
+}
+
+/** 一次按判定变化做的调整 */
+export interface GroupChange {
+  account_id: string
+  from: Level
+  to: Level
+  at_ms: number
+  added: string[]
+  removed: string[]
 }
 
 export interface CprGroup {

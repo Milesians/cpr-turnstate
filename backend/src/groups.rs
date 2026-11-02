@@ -1,14 +1,17 @@
-//! 自动分组：按测票当前判定（连续 3 次确认的那个）调整 CPR 分组成员
+//! 自动分组：账号的测票当前判定（连续 3 次确认的那个）变化时调整 CPR 分组成员
 //!
-//! 两种规则：
+//! 只在判定变化时动（用户 2026-11-02）：每个账号记下自动分组上次按哪个判定调整过；判定变了，
+//! 只对这个账号按“旧判定 → 新判定”做最小改动：新判定符合、旧判定不符合的组加进去，旧判定符合、
+//! 新判定不符合的组移出去，其余一概不动。不做全量核对，不纠正 CPR 里的手动改动；保存设置、
+//! 删除规则都不改成员。第一次看到某个账号、或从关闭切到开启时，只记下当前判定作为起点。
+//!
+//! 两种目标分组：
 //! - 插件新建的分组：插件 SDK 只允许插件改自己建的分组（按 resource_key）。分组名和颜色只在第一次
-//!   创建时使用，之后在 CPR 的分组管理里改；管理员删掉分组后下次同步重建；删掉规则先清空成员再丢掉。
-//! - CPR 现有分组（用户 2026-11-02）：SDK 改不了，经 CPR 管理员接口（[`crate::admin`]）读账号现在
-//!   所在的全部分组，换掉规则管的那几个后整体写回（CPR 只支持整体替换）；删掉规则只是不再调整。
-//!
-//! 关闭自动分组后成员保持原样。
+//!   创建时使用，之后在 CPR 的分组管理里改；管理员删掉分组后下次调整时重建。
+//! - CPR 现有分组：SDK 改不了，经 CPR 管理员接口（[`crate::admin`]）读账号现在所在的全部分组，
+//!   加上或去掉这条规则的分组后整体写回（CPR 只支持整体替换）。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use gateway_plugin_sdk::{
@@ -24,14 +27,10 @@ use serde::{Deserialize, Serialize};
 use crate::admin::{Admin, GroupRef};
 use crate::clock::now_ms;
 use crate::runner::{Runner, supported};
-use crate::store::{self, Method};
+use crate::store;
 use crate::verdict::{Level, one_line};
 
 pub const MAX_RULES: usize = 8;
-/// 全量重读判定、纠正 CPR 里手动改动的间隔；其间只处理刚测完的账号
-const FULL_SYNC_MS: i64 = 5 * 60 * 1000;
-/// 改成员失败后多久全量重试
-const RETRY_MS: i64 = 60 * 1000;
 /// 宿主单次增删上限
 const CHUNK: usize = 200;
 const RULE_PREFIX: &str = "auto-";
@@ -51,9 +50,6 @@ fn valid_group_id(id: &str) -> bool {
 pub struct GroupConfig {
     pub enabled: bool,
     pub rules: Vec<GroupRule>,
-    /// 删掉的插件新建分组的规则：成员清空前留着，清空后丢掉
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub retired: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,26 +129,43 @@ pub struct RuleStatus {
     /// CPR 里的分组 ID 和当前名称（可能已在 CPR 改名）
     pub group_id: String,
     pub group_name: String,
-    pub members: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// 最近一次按判定变化调整的结果
+#[derive(Debug, Clone, Serialize)]
+pub struct Change {
+    pub account_id: String,
+    pub from: Level,
+    pub to: Level,
+    pub at_ms: i64,
+    /// 加进去和移出去的分组名
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Status {
+    /// 上次调整（或核对起点）的时间
     pub synced_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub rules: BTreeMap<String, RuleStatus>,
+    /// 最近的调整，新的在前，最多 20 条
+    pub changes: Vec<Change>,
 }
+
+const MAX_CHANGES: usize = 20;
 
 #[derive(Default)]
 struct State {
-    /// 每个账号的测票当前判定；不支持探测的账号不在里面
-    levels: HashMap<String, Level>,
     /// 插件新建的分组在 CPR 里的 ID，不能再被选作现有分组
     owned_group_ids: BTreeSet<String>,
-    full_ms: i64,
+    /// 启动后核对过所有账号没有（补上插件不在时的判定变化、给新账号记起点）
+    scanned: bool,
+    /// 上次调整失败、下一轮再试的账号
+    retry: BTreeSet<String>,
     status: Status,
 }
 
@@ -204,7 +217,7 @@ pub struct Existing<'a> {
     pub forbidden: &'a BTreeSet<String>,
 }
 
-/// 校验页面提交的设置，得到新设置；删掉的插件新建分组规则进 `retired`
+/// 校验页面提交的设置，得到新设置
 ///
 /// # Errors
 /// 设置不合法时返回给页面看的原因
@@ -309,20 +322,9 @@ pub fn apply_input(
             plans,
         });
     }
-    let mut retired = current.retired.clone();
-    for old in &current.rules {
-        if old.group_id.is_none()
-            && !rules.iter().any(|r| r.id == old.id)
-            && !retired.contains(&old.id)
-        {
-            retired.push(old.id.clone());
-        }
-    }
-    retired.retain(|id| !rules.iter().any(|r| &r.id == id));
     Ok(GroupConfig {
         enabled: input.enabled,
         rules,
-        retired,
     })
 }
 
@@ -339,22 +341,26 @@ fn host_message(error: &PluginFault) -> String {
     }
 }
 
-/// 把账号按是否进组分批增删；没有变化时宿主不发布新配置
-async fn set_members(
-    host: &HostClient,
-    resource_key: &str,
-    accounts: &[(&str, bool)],
-) -> Result<(), PluginFault> {
-    for chunk in accounts.chunks(CHUNK) {
-        let (add, remove): (Vec<_>, Vec<_>) = chunk.iter().partition(|(_, member)| *member);
-        host.change_group_members(GroupMembersChange {
-            resource_key: resource_key.to_owned(),
-            add: add.into_iter().map(|(id, _)| (*id).to_owned()).collect(),
-            remove: remove.into_iter().map(|(id, _)| (*id).to_owned()).collect(),
-        })
-        .await?;
+/// 一个账号的判定变化
+struct Transition {
+    account_id: String,
+    from: Level,
+    to: Level,
+    plan: String,
+}
+
+impl Transition {
+    /// 这条规则对这个账号要做的：`Some(true)` 加进去，`Some(false)` 移出去，`None` 不动
+    fn action(&self, rule: &GroupRule) -> Option<bool> {
+        let before = rule.admits(Some(&self.from), Some(&self.plan));
+        let after = rule.admits(Some(&self.to), Some(&self.plan));
+        (before != after).then_some(after)
     }
-    Ok(())
+}
+
+/// 调整中可以下一轮重试的失败（宿主或管理接口暂时不可用）；配置问题（重名、分组被删）不重试
+struct Outcome {
+    retry: bool,
 }
 
 impl Groups {
@@ -371,269 +377,376 @@ impl Groups {
         ids
     }
 
-    /// 每轮维护和保存设置后调用；`force` 时全量重读判定并同步所有账号
+    /// 每轮维护调用：只处理刚测完（和上次失败）的账号；启动后第一次核对全部账号
     ///
     /// # Errors
-    /// 读设置或账号失败时返回错误；分组操作失败记在状态里
+    /// 读设置或历史失败时返回错误；分组操作失败记在状态里
     pub async fn sync(
         &self,
         runner: &Runner,
         host: &HostClient,
         accounts: &[AuthRuntimeAccount],
-        force: bool,
     ) -> Result<(), PluginFault> {
         let _guard = self.sync.lock().await;
         let (config, _) = store::group_config(host).await?;
-        // 关闭期间测完的账号也要记下，开启时一并处理
         let finished = runner.take_turnstate_finished();
-        if !config.enabled && config.retired.is_empty() {
-            return Ok(());
-        }
-        let now = now_ms();
-        let full = force || now - lock(&self.state).full_ms >= FULL_SYNC_MS;
-        let ids: Vec<&str> = accounts.iter().map(|a| a.account_id.as_str()).collect();
-
-        let retired_error = if config.retired.is_empty() {
-            None
-        } else {
-            self.clear_retired(host, &config, &ids).await?
-        };
-        lock(&self.state).status.error.clone_from(&retired_error);
         if !config.enabled {
             return Ok(());
         }
-
-        // 要重读判定的账号
-        let reread: Vec<&AuthRuntimeAccount> = accounts
-            .iter()
-            .filter(|a| supported(a) && (full || finished.contains(&a.account_id)))
-            .collect();
-        if !full && reread.is_empty() {
-            return Ok(());
-        }
-        let mut changed: BTreeSet<String> = BTreeSet::new();
-        let mut levels = HashMap::with_capacity(reread.len());
-        for a in &reread {
-            let (_, health) =
-                store::history_with_health(host, &a.account_id, Method::Turnstate).await?;
-            levels.insert(
-                a.account_id.clone(),
-                health.map_or(Level::Unknown, |h| h.health.level),
-            );
-        }
-        {
-            let mut state = lock(&self.state);
-            if full {
-                state.levels.retain(|id, _| levels.contains_key(id));
-            }
-            for (id, level) in levels {
-                if state.levels.insert(id.clone(), level) != Some(level) {
-                    changed.insert(id);
-                }
-            }
-        }
-        if !full && changed.is_empty() {
-            return Ok(());
-        }
-        let levels = lock(&self.state).levels.clone();
-        let plans: HashMap<String, String> = accounts
-            .iter()
-            .map(|a| (a.account_id.clone(), plan_of(a)))
-            .collect();
-        // 全量时同步所有账号（不支持探测的移出），否则只同步判定变了的账号
-        let targets: Vec<&str> = if full {
-            ids.clone()
-        } else {
-            changed.iter().map(String::as_str).collect()
+        let (scan_all, retry) = {
+            let state = lock(&self.state);
+            (!state.scanned, state.retry.clone())
         };
-
-        let mut statuses = BTreeMap::new();
-        // 只有改成员失败才提前重试；建组失败（多半重名）要等用户改规则，按常规间隔重试
-        let mut retry = false;
-        for rule in config.rules.iter().filter(|r| r.group_id.is_none()) {
-            let mut status = RuleStatus {
-                members: levels
-                    .iter()
-                    .filter(|(id, l)| {
-                        rule.admits(Some(l), plans.get(id.as_str()).map(String::as_str))
-                    })
-                    .count(),
-                ..RuleStatus::default()
-            };
-            let result = async {
-                let group = host
-                    .ensure_group(GroupEnsureRequest {
-                        resource_key: rule.id.clone(),
-                        name: rule.name.clone(),
-                        color: rule.color.clone(),
-                        description: Some("账号探测插件按测票当前判定自动维护成员".into()),
-                    })
-                    .await?;
-                lock(&self.state).owned_group_ids.insert(group.id.clone());
-                status.group_id = group.id;
-                status.group_name = group.name;
-                let members: Vec<(&str, bool)> = targets
-                    .iter()
-                    .map(|id| {
-                        (
-                            *id,
-                            rule.admits(levels.get(*id), plans.get(*id).map(String::as_str)),
-                        )
-                    })
-                    .collect();
-                set_members(host, &rule.id, &members)
-                    .await
-                    .inspect_err(|_| retry = true)
-            }
-            .await;
-            if let Err(error) = result {
-                status.error = Some(host_message(&error));
-            }
-            statuses.insert(rule.id.clone(), status);
-        }
-        let existing: Vec<&GroupRule> = config
-            .rules
+        let candidates: Vec<&AuthRuntimeAccount> = accounts
             .iter()
-            .filter(|r| r.group_id.is_some())
+            .filter(|a| {
+                supported(a)
+                    && (scan_all
+                        || finished.contains(&a.account_id)
+                        || retry.contains(&a.account_id))
+            })
             .collect();
-        if !existing.is_empty() {
-            let changed: BTreeSet<&str> = changed.iter().map(String::as_str).collect();
-            if let Err(reason) = sync_existing(
-                runner,
-                host,
-                &existing,
-                &levels,
-                &plans,
-                (!full).then_some(&changed),
-                &mut statuses,
-            )
-            .await
-            {
-                retry = true;
-                for rule in &existing {
-                    statuses.entry(rule.id.clone()).or_default().error = Some(reason.clone());
-                }
+        let mut transitions = Vec::new();
+        for a in candidates {
+            let (current, applied) = store::group_levels(host, &a.account_id).await?;
+            match applied {
+                // 起点：不调整
+                None => store::set_grouped_level(host, &a.account_id, current).await?,
+                Some(applied) if applied == current => {}
+                Some(applied) => transitions.push(Transition {
+                    account_id: a.account_id.clone(),
+                    from: applied,
+                    to: current,
+                    plan: plan_of(a),
+                }),
+            }
+        }
+        lock(&self.state).scanned = true;
+        if transitions.is_empty() {
+            lock(&self.state).retry.clear();
+            return Ok(());
+        }
+        let mut changes: Vec<Change> = transitions
+            .iter()
+            .map(|t| Change {
+                account_id: t.account_id.clone(),
+                from: t.from,
+                to: t.to,
+                at_ms: now_ms(),
+                added: Vec::new(),
+                removed: Vec::new(),
+            })
+            .collect();
+        let mut statuses = lock(&self.state).status.rules.clone();
+        statuses.retain(|id, _| config.rules.iter().any(|r| &r.id == id));
+        let owned = self
+            .apply_owned(host, &config, &transitions, &mut changes, &mut statuses)
+            .await;
+        let existing = apply_existing(
+            runner,
+            host,
+            &config,
+            &transitions,
+            &mut changes,
+            &mut statuses,
+        )
+        .await;
+        let retry = owned.retry || existing.retry;
+        if !retry {
+            for t in &transitions {
+                store::set_grouped_level(host, &t.account_id, t.to).await?;
             }
         }
         let mut state = lock(&self.state);
-        // 改成员失败的，一分钟后全量重试，保证成员最终一致
-        state.full_ms = if retry {
-            now - FULL_SYNC_MS + RETRY_MS
-        } else if full {
-            now
+        state.retry = if retry {
+            transitions.iter().map(|t| t.account_id.clone()).collect()
         } else {
-            state.full_ms
+            BTreeSet::new()
         };
-        state.status = Status {
-            synced_ms: now,
-            error: retired_error,
-            rules: statuses,
-        };
+        state.status.synced_ms = now_ms();
+        state.status.rules = statuses;
+        if !retry {
+            for change in changes.into_iter().rev() {
+                state.status.changes.insert(0, change);
+            }
+            state.status.changes.truncate(MAX_CHANGES);
+        }
         Ok(())
     }
 
-    /// 清空删掉的规则的成员；返回清不掉的原因
-    async fn clear_retired(
+    /// 保存设置后调用：不改任何成员。从关闭切到开启时，按当前判定重新记起点；
+    /// 确认插件新建的分组存在、读现有分组的名称，结果放进状态
+    ///
+    /// # Errors
+    /// 读设置或历史失败时返回错误
+    pub async fn after_save(
+        &self,
+        runner: &Runner,
+        host: &HostClient,
+        accounts: &[AuthRuntimeAccount],
+        enabling: bool,
+    ) -> Result<(), PluginFault> {
+        let _guard = self.sync.lock().await;
+        let (config, _) = store::group_config(host).await?;
+        if !config.enabled {
+            return Ok(());
+        }
+        if enabling {
+            runner.take_turnstate_finished();
+            for a in accounts.iter().filter(|a| supported(a)) {
+                let (current, _) = store::group_levels(host, &a.account_id).await?;
+                store::set_grouped_level(host, &a.account_id, current).await?;
+            }
+            let mut state = lock(&self.state);
+            state.scanned = true;
+            state.retry.clear();
+        }
+        let mut statuses = BTreeMap::new();
+        for rule in config.rules.iter().filter(|r| r.group_id.is_none()) {
+            let status: &mut RuleStatus = statuses.entry(rule.id.clone()).or_default();
+            match self.ensure(host, rule).await {
+                Ok((id, name)) => {
+                    status.group_id = id;
+                    status.group_name = name;
+                }
+                Err(error) => status.error = Some(host_message(&error)),
+            }
+        }
+        if config.rules.iter().any(|r| r.group_id.is_some()) {
+            let groups = match Admin::new(host, &runner.config) {
+                Ok(admin) => admin.groups().await,
+                Err(reason) => Err(reason),
+            };
+            for rule in config.rules.iter().filter(|r| r.group_id.is_some()) {
+                let status: &mut RuleStatus = statuses.entry(rule.id.clone()).or_default();
+                describe_existing(rule, groups.as_deref(), status);
+            }
+        }
+        let mut state = lock(&self.state);
+        state.status.rules = statuses;
+        state.status.synced_ms = now_ms();
+        state.status.error = None;
+        Ok(())
+    }
+
+    /// 建（或找到）插件新建的分组，返回 CPR 里的 ID 和当前名称
+    async fn ensure(
+        &self,
+        host: &HostClient,
+        rule: &GroupRule,
+    ) -> Result<(String, String), PluginFault> {
+        let group = host
+            .ensure_group(GroupEnsureRequest {
+                resource_key: rule.id.clone(),
+                name: rule.name.clone(),
+                color: rule.color.clone(),
+                description: Some("账号探测插件在测票判定变化时调整成员".into()),
+            })
+            .await?;
+        lock(&self.state).owned_group_ids.insert(group.id.clone());
+        Ok((group.id, group.name))
+    }
+
+    async fn apply_owned(
         &self,
         host: &HostClient,
         config: &GroupConfig,
-        ids: &[&str],
-    ) -> Result<Option<String>, PluginFault> {
-        let members: Vec<(&str, bool)> = ids.iter().map(|id| (*id, false)).collect();
-        let mut cleared = Vec::new();
-        let mut error = None;
-        for id in &config.retired {
-            match set_members(host, id, &members).await {
-                Ok(()) => cleared.push(id.clone()),
-                // 分组从没建过或已在 CPR 删掉（宿主报冲突）：没什么可清的
-                Err(e)
-                    if matches!(
-                        e.code,
-                        ErrorCode::Conflict | ErrorCode::PermissionDenied | ErrorCode::Rejected
-                    ) =>
-                {
-                    cleared.push(id.clone());
+        transitions: &[Transition],
+        changes: &mut [Change],
+        statuses: &mut BTreeMap<String, RuleStatus>,
+    ) -> Outcome {
+        let mut retry = false;
+        for rule in config.rules.iter().filter(|r| r.group_id.is_none()) {
+            let actions: Vec<(usize, bool)> = transitions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| t.action(rule).map(|a| (i, a)))
+                .collect();
+            if actions.is_empty() {
+                continue;
+            }
+            let status = statuses.entry(rule.id.clone()).or_default();
+            let (group_id, group_name) = match self.ensure(host, rule).await {
+                Ok(found) => found,
+                // 重名等配置问题：等用户改规则，不重试
+                Err(error) => {
+                    status.error = Some(host_message(&error));
+                    continue;
                 }
-                Err(e) => error = Some(format!("清空已删除规则的分组失败：{}", host_message(&e))),
+            };
+            status.group_id = group_id;
+            status.group_name.clone_from(&group_name);
+            status.error = None;
+            let mut failed = None;
+            for chunk in actions.chunks(CHUNK) {
+                let pick = |add: bool| -> Vec<String> {
+                    chunk
+                        .iter()
+                        .filter(|(_, a)| *a == add)
+                        .map(|(i, _)| transitions[*i].account_id.clone())
+                        .collect()
+                };
+                if let Err(error) = host
+                    .change_group_members(GroupMembersChange {
+                        resource_key: rule.id.clone(),
+                        add: pick(true),
+                        remove: pick(false),
+                    })
+                    .await
+                {
+                    failed = Some(error);
+                    break;
+                }
+            }
+            match failed {
+                Some(error) => {
+                    retry = true;
+                    status.error = Some(host_message(&error));
+                }
+                None => {
+                    for (i, add) in actions {
+                        let list = if add {
+                            &mut changes[i].added
+                        } else {
+                            &mut changes[i].removed
+                        };
+                        list.push(group_name.clone());
+                    }
+                }
             }
         }
-        if !cleared.is_empty() {
-            let _ = store::update_group_config(host, |c| {
-                c.retired.retain(|id| !cleared.contains(id));
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(error)
+        Outcome { retry }
     }
 }
 
-/// 经 CPR 管理员接口调整现有分组：读账号现在的全部分组，换掉规则管的那几个，整体写回。
-/// `only` 有值时只处理这些账号（刚测完、判定变了的），否则处理全部账号
-async fn sync_existing(
-    runner: &Runner,
-    host: &HostClient,
-    rules: &[&GroupRule],
-    levels: &HashMap<String, Level>,
-    plans: &HashMap<String, String>,
-    only: Option<&BTreeSet<&str>>,
-    statuses: &mut BTreeMap<String, RuleStatus>,
-) -> Result<(), String> {
-    let admin = Admin::new(host, &runner.config)?;
-    let groups = admin.groups().await?;
-    // 分组在 CPR 里删掉了的规则不动，其余照常
-    let mut managed: Vec<(&GroupRule, &str)> = Vec::new();
-    for rule in rules {
-        let gid = rule.group_id.as_deref().unwrap_or_default();
-        let status = statuses.entry(rule.id.clone()).or_default();
-        status.group_id = gid.to_owned();
-        status.members = levels
-            .iter()
-            .filter(|(id, l)| rule.admits(Some(l), plans.get(id.as_str()).map(String::as_str)))
-            .count();
-        match groups.iter().find(|g| g.id == gid) {
+fn describe_existing(
+    rule: &GroupRule,
+    groups: Result<&[GroupRef], &String>,
+    status: &mut RuleStatus,
+) {
+    let gid = rule.group_id.as_deref().unwrap_or_default();
+    status.group_id = gid.to_owned();
+    status.group_name.clone_from(&rule.name);
+    match groups {
+        Ok(groups) => match groups.iter().find(|g| g.id == gid) {
             Some(group) => {
                 status.group_name.clone_from(&group.name);
-                managed.push((rule, gid));
+                status.error = None;
             }
             None => {
-                status.group_name.clone_from(&rule.name);
                 status.error = Some("CPR 里找不到这个分组（可能已删除），请删掉这条规则".into());
             }
+        },
+        Err(reason) => status.error = Some(reason.clone()),
+    }
+}
+
+/// 经 CPR 管理员接口调整现有分组：只读、只写判定变了的账号；每个账号读它现在的全部分组，
+/// 加上或去掉规则的分组后整体写回，账号的其他分组（包括手动加的）不变
+async fn apply_existing(
+    runner: &Runner,
+    host: &HostClient,
+    config: &GroupConfig,
+    transitions: &[Transition],
+    changes: &mut [Change],
+    statuses: &mut BTreeMap<String, RuleStatus>,
+) -> Outcome {
+    let rules: Vec<&GroupRule> = config
+        .rules
+        .iter()
+        .filter(|r| r.group_id.is_some())
+        .collect();
+    let needed = rules
+        .iter()
+        .any(|rule| transitions.iter().any(|t| t.action(rule).is_some()));
+    if !needed {
+        return Outcome { retry: false };
+    }
+    let fail = |statuses: &mut BTreeMap<String, RuleStatus>, reason: &str| {
+        for rule in &rules {
+            statuses.entry(rule.id.clone()).or_default().error = Some(reason.to_owned());
+        }
+        Outcome { retry: true }
+    };
+    let admin = match Admin::new(host, &runner.config) {
+        Ok(admin) => admin,
+        // 没配好是配置问题，不重试
+        Err(reason) => {
+            fail(statuses, &reason);
+            return Outcome { retry: false };
+        }
+    };
+    let groups = match admin.groups().await {
+        Ok(groups) => groups,
+        Err(reason) => return fail(statuses, &reason),
+    };
+    // 分组在 CPR 里删掉了的规则不动
+    let mut live: Vec<(&GroupRule, &str, String)> = Vec::new();
+    for rule in &rules {
+        let status = statuses.entry(rule.id.clone()).or_default();
+        describe_existing(rule, Ok(&groups), status);
+        if status.error.is_none() {
+            live.push((
+                rule,
+                rule.group_id.as_deref().unwrap_or_default(),
+                status.group_name.clone(),
+            ));
         }
     }
-    if managed.is_empty() {
-        return Ok(());
+    if live.is_empty() {
+        return Outcome { retry: false };
     }
-    let managed_ids: BTreeSet<&str> = managed.iter().map(|(_, gid)| *gid).collect();
-    // 结果相同的账号合成一批写
-    let mut batches: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
-    for account in admin.accounts().await? {
-        if only.is_some_and(|only| !only.contains(account.id.as_str())) {
+    let accounts = match admin.accounts().await {
+        Ok(accounts) => accounts,
+        Err(reason) => return fail(statuses, &reason),
+    };
+    let mut batches: BTreeMap<Vec<String>, Vec<usize>> = BTreeMap::new();
+    for (i, t) in transitions.iter().enumerate() {
+        let Some(account) = accounts.iter().find(|a| a.id == t.account_id) else {
             continue;
-        }
+        };
         let current: BTreeSet<&str> = account.groups.iter().map(|g| g.id.as_str()).collect();
-        let level = levels.get(&account.id);
-        let plan = plans.get(&account.id).map(String::as_str);
-        let mut desired: BTreeSet<&str> = current
-            .iter()
-            .copied()
-            .filter(|g| !managed_ids.contains(g))
-            .collect();
-        for (rule, gid) in &managed {
-            if rule.admits(level, plan) {
-                desired.insert(gid);
+        let mut desired = current.clone();
+        for (rule, gid, _) in &live {
+            match t.action(rule) {
+                Some(true) => {
+                    desired.insert(gid);
+                }
+                Some(false) => {
+                    desired.remove(gid);
+                }
+                None => {}
             }
         }
         if desired != current {
             batches
                 .entry(desired.into_iter().map(str::to_owned).collect())
                 .or_default()
-                .push(account.id.clone());
+                .push(i);
         }
     }
-    for (group_ids, account_ids) in &batches {
-        admin.set_groups(account_ids, group_ids).await?;
+    for (group_ids, indexes) in &batches {
+        let ids: Vec<String> = indexes
+            .iter()
+            .map(|i| transitions[*i].account_id.clone())
+            .collect();
+        if let Err(reason) = admin.set_groups(&ids, group_ids).await {
+            return fail(statuses, &reason);
+        }
     }
-    Ok(())
+    // 记下每个账号实际加进/移出的现有分组
+    for (i, t) in transitions.iter().enumerate() {
+        let Some(account) = accounts.iter().find(|a| a.id == t.account_id) else {
+            continue;
+        };
+        for (rule, gid, name) in &live {
+            let member = account.groups.iter().any(|g| g.id == *gid);
+            match t.action(rule) {
+                Some(true) if !member => changes[i].added.push(name.clone()),
+                Some(false) if member => changes[i].removed.push(name.clone()),
+                _ => {}
+            }
+        }
+    }
+    Outcome { retry: false }
 }

@@ -189,7 +189,6 @@ async fn groups_view(app: &App, host: &HostClient) -> Result<Value, ApiError> {
     Ok(json!({
         "enabled": config.enabled,
         "rules": config.rules,
-        "retired": config.retired.len(),
         "max_rules": crate::groups::MAX_RULES,
         "status": app.groups.status(),
         "admin_error": crate::admin::base_url(&app.runner.config).err(),
@@ -243,15 +242,19 @@ async fn save_groups(
         groups: groups.as_deref(),
         forbidden: &forbidden,
     };
+    let mut was_enabled = false;
     store::update_group_config(host, |config| {
+        was_enabled = config.enabled;
         *config = crate::groups::apply_input(config, input.clone(), &existing)?;
         Ok(())
     })
     .await?
     .map_err(ApiError::invalid)?;
-    // 保存后马上全量同步一次；失败记在状态里，不影响保存
+    // 保存不改任何成员；从关闭切到开启时按当前判定重新记起点
     let accounts = host::openai_accounts(host).await?;
-    let _ = app.groups.sync(&app.runner, host, &accounts, true).await;
+    app.groups
+        .after_save(&app.runner, host, &accounts, input.enabled && !was_enabled)
+        .await?;
     groups_view(app, host).await
 }
 

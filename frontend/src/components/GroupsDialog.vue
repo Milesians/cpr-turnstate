@@ -110,7 +110,7 @@ async function save() {
       ? { id: r.id, name: r.name.trim(), color: r.color, levels: r.levels, plans: r.plans ?? [] }
       : { id: r.id, group_id: r.group_id, name: r.name, color: r.color, levels: r.levels, plans: r.plans ?? [] })
     fill(await api.saveGroups(enabled.value, body))
-    notice.value = enabled.value ? '已保存，并按当前测票判定同步了分组' : '已保存；自动分组关闭，分组成员保持不变'
+    notice.value = enabled.value ? '已保存；之后账号的测票判定变化时才调整分组，现有成员不动' : '已保存；自动分组关闭，分组成员保持不变'
   }
   catch (e) { error.value = (e as Error).message }
   finally { saving.value = false }
@@ -142,7 +142,7 @@ async function save() {
         <div v-else class="flex flex-col gap-1">
           <ZSelect v-if="!rule.id" v-model="rule.group_id" :options="groupOptions" filterable placeholder="选择 CPR 分组" :disabled="saving || !!view?.admin_error" :aria-label="`第 ${i + 1} 个规则的 CPR 分组`" />
           <span v-else class="flex items-center gap-2"><span class="inline-block size-3 rounded-full" :style="{ backgroundColor: rule.color }" aria-hidden="true" />{{ rule.name }}</span>
-          <span class="text-cp-xs text-cp-text-tertiary">经 CPR 管理接口调整：不符合的原有成员会被移出；删除规则后不再调整，成员保持当时的状态</span>
+          <span class="text-cp-xs text-cp-text-tertiary">经 CPR 管理接口调整：只在账号判定变化时加入或移出这个账号，原有成员和账号的其他分组不动</span>
         </div>
         <div class="flex flex-wrap items-center gap-3">
           <span class="text-cp-xs text-cp-text-secondary">判定为</span>
@@ -156,9 +156,9 @@ async function save() {
         </div>
         <p v-if="rule.id && view?.status.rules[rule.id]" class="m-0 text-cp-xs" :class="view.status.rules[rule.id]!.error ? 'text-cp-warning-text' : 'text-cp-text-tertiary'">
           <template v-if="view.status.rules[rule.id]!.error">{{ view.status.rules[rule.id]!.error }}</template>
-          <template v-else>CPR 分组“{{ view.status.rules[rule.id]!.group_name }}” · {{ view.status.rules[rule.id]!.members }} 个账号</template>
+          <template v-else>CPR 分组“{{ view.status.rules[rule.id]!.group_name }}”</template>
         </p>
-        <p v-else-if="!rule.id && kind(rule) === 'owned'" class="m-0 text-cp-xs text-cp-text-tertiary">保存后在 CPR 新建这个分组；名称和颜色之后在 CPR 的分组管理里改</p>
+        <p v-else-if="!rule.id && kind(rule) === 'owned'" class="m-0 text-cp-xs text-cp-text-tertiary">保存后在 CPR 新建这个空分组，之后账号判定变化时加入；名称和颜色之后在 CPR 的分组管理里改</p>
       </div>
       <p v-if="view?.admin_error && rules.some(r => r.group_id !== undefined)" class="m-0 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-warning-on-container">{{ view.admin_error }}</p>
       <p v-else-if="cprError" class="m-0 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-warning-on-container">读不到 CPR 的分组：{{ cprError }}</p>
@@ -166,13 +166,21 @@ async function save() {
         <ZButton size="small" :disabled="saving || rules.length >= (view?.max_rules ?? 8)" @click="add">
           <Plus :size="14" aria-hidden="true" /> 添加分组
         </ZButton>
-        <span v-if="view?.status.synced_ms" class="text-cp-xs text-cp-text-tertiary">上次同步 {{ dateTime(view.status.synced_ms) }}</span>
+        <span v-if="view?.status.synced_ms" class="text-cp-xs text-cp-text-tertiary">上次调整 {{ dateTime(view.status.synced_ms) }}</span>
       </div>
       <p class="m-0 text-cp-xs text-cp-text-tertiary">
-        刚测完的账号下一轮维护（约 30 秒）调整，每 5 分钟全量核对一次并纠正 CPR 里的手动改动；不支持探测的账号不进任何组；关闭后成员保持不变。
-        插件新建的分组删除规则时会清空成员，分组本身请在 CPR 里删除<span v-if="view?.retired">（还有 {{ view.retired }} 个待清空）</span>。
+        只在账号的测票当前判定变化时调整，而且只动这个账号：新判定符合、旧判定不符合的组加进去，旧判定符合、新判定不符合的组移出去，其他分组和 CPR 里的手动改动都保留。
+        保存设置、删除规则、关闭自动分组都不改成员；开启时以各账号当前判定为起点，不补之前的变化。不支持探测的账号不处理。
         选 CPR 现有分组需要在插件设置里填写 CPR 地址和管理 API Key（该 Key 拥有全部管理权限，插件只用它读分组和改账号的分组）。
       </p>
+      <div v-if="view?.status.changes?.length" class="flex flex-col gap-1">
+        <span class="text-cp-xs font-medium text-cp-text-secondary">最近的调整</span>
+        <ul class="m-0 flex max-h-40 list-none flex-col gap-1 overflow-auto p-0 text-cp-xs text-cp-text-tertiary">
+          <li v-for="(c, i) in view.status.changes" :key="i">
+            {{ dateTime(c.at_ms) }} · {{ c.account_id }} · {{ levelLabel[c.from] }} → {{ levelLabel[c.to] }}<template v-if="c.added.length"> · 加入 {{ c.added.join('、') }}</template><template v-if="c.removed.length"> · 移出 {{ c.removed.join('、') }}</template><template v-if="!c.added.length && !c.removed.length"> · 没有分组需要变</template>
+          </li>
+        </ul>
+      </div>
       <p v-if="view?.status.error" class="m-0 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-warning-on-container">{{ view.status.error }}</p>
       <p v-if="error" class="m-0 rounded-cp bg-cp-error-container px-3 py-2 text-cp-error-on-container" role="alert">{{ error }}</p>
       <p v-if="notice" class="m-0 text-cp-xs text-cp-success" role="status">{{ notice }}</p>

@@ -106,8 +106,8 @@ impl Scheduler {
             runner.abandon(host, &account_id, &run_id).await?;
         }
         self.recover(runner, host, &accounts).await?;
-        // 分组按上一轮及手动测完的结果调整；不发探测，不受“发出真实探测”开关影响
-        if let Err(error) = groups.sync(runner, host, &accounts, false).await {
+        // 判定变了的账号调整分组；不发探测，不受“发出真实探测”开关影响
+        if let Err(error) = groups.sync(runner, host, &accounts).await {
             host::log(
                 host,
                 "group_sync_failed",

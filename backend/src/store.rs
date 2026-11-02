@@ -196,6 +196,9 @@ struct History {
     notifications: Vec<Notification>,
     #[serde(default)]
     notifications_dropped: u32,
+    /// 自动分组上次按哪个当前判定调整过；没有表示还没记下起点
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grouped_level: Option<Level>,
 }
 
 impl History {
@@ -468,6 +471,46 @@ pub async fn history_with_health(
     let (history, _) = history_record(host, account_id, method).await?;
     let health = (method == Method::Turnstate).then(|| history.health_view());
     Ok((history.runs, health))
+}
+
+/// 账号测票的当前判定，和自动分组上次按哪个判定调整过
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn group_levels(
+    host: &HostClient,
+    account_id: &str,
+) -> Result<(Level, Option<Level>), PluginFault> {
+    let (history, _) = history_record(host, account_id, Method::Turnstate).await?;
+    Ok((history.health_view().health.level, history.grouped_level))
+}
+
+/// 记下自动分组已按 `level` 调整过（或以它为起点）
+///
+/// # Errors
+/// 回调失败或一直冲突时返回错误
+pub async fn set_grouped_level(
+    host: &HostClient,
+    account_id: &str,
+    level: Level,
+) -> Result<(), PluginFault> {
+    let key = history_key(account_id, Method::Turnstate);
+    for _ in 0..5 {
+        let (mut history, version) = history_record(host, account_id, Method::Turnstate).await?;
+        if history.grouped_level == Some(level) {
+            return Ok(());
+        }
+        history.grouped_level = Some(level);
+        match host::state_put(host, HISTORY, &key, encode(&history)?, version).await {
+            Ok(_) => return Ok(()),
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "探测历史被同时修改，请重试",
+    ))
 }
 
 async fn history_record(
