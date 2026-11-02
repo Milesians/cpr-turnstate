@@ -100,7 +100,16 @@ async fn telegram_recovery_regression_and_restart_preserve_raw_history() {
     let body = &host.seen_public_bodies[0];
     assert_eq!(body["chat_id"], "-10012345");
     assert_eq!(body["message_thread_id"], 42);
-    assert!(body["text"].as_str().unwrap().contains("降智 → 正常"));
+    let text = body["text"].as_str().unwrap();
+    assert!(text.contains("降智 → 正常"));
+    assert!(
+        text.contains("账号：name-acct_a\n邮箱：acct_a@example.com\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("（北京时间）") && !text.contains("Unix"),
+        "{text}"
+    );
     assert!(body.get("parse_mode").is_none());
     assert_eq!(
         host.get("history", "acct_a/turnstate").unwrap()["health"]["level"],

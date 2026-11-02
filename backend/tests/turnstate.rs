@@ -178,3 +178,13 @@ fn overload_is_suspect_only_when_the_upstream_says_so() {
     };
     assert!(bare.overloaded_verdict().is_none());
 }
+
+#[test]
+fn telegram_times_are_beijing_time() {
+    use cpr_account_probe::telegram::beijing_time;
+    assert_eq!(beijing_time(1_793_588_642_867), "2026-11-02 11:04:02");
+    assert_eq!(beijing_time(0), "1970-01-01 08:00:00");
+    assert_eq!(beijing_time(951_782_400_000), "2000-02-29 08:00:00");
+    assert_eq!(beijing_time(1_735_660_799_000), "2024-12-31 23:59:59");
+    assert_eq!(beijing_time(1_735_660_800_000), "2025-01-01 00:00:00");
+}

@@ -13,7 +13,7 @@ mod runner;
 mod scheduler;
 mod session;
 pub mod store;
-mod telegram;
+pub mod telegram;
 pub mod turnstate;
 pub mod verdict;
 
