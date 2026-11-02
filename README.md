@@ -11,7 +11,7 @@
 | | 测票 | ModelTrace |
 | --- | --- | --- |
 | 做什么 | 先拿一张 `X-Codex-Turn-State` 票，再带回最新的票最多 3 次（KlN-4096/sub2api v0.2.17-klno.1 的回声判据） | 发 3 道“选 N 个 1 到 355 的整数”的题，按数字分布和 [ModelTrace](https://github.com/xqy2006/ModelTrace) 指纹库比对 |
-| 怎么发 | `host.http.account`：插件按当前凭据自己写请求，直连 `chatgpt.com/backend-api/codex/responses`，走账号在 CPR 绑定的代理（没绑就直连；绑了但不可用就失败，不回退直连）。UA、Originator、Version 实时复用 CPR 全局客户端身份；多 `Session_id`、`X-Codex-Turn-State` 和 `reasoning.effort=low`，一次测票内带上游下发的 cookie | `host.model.execute`：走 CPR 自己的模型链并指定这个账号，用插件自己维护的 Client Key“账号探测（ModelTrace）”（计入它的用量；分组“账号探测”的成员由插件维护） |
+| 怎么发 | `host.http.account`：插件按当前凭据自己写请求，直连 `chatgpt.com/backend-api/codex/responses`，走账号在 CPR 绑定的代理（没绑就直连；绑了但不可用就失败，不回退直连）。UA、Originator、Version 实时复用 CPR 全局客户端身份；多 `Session_id`、`X-Codex-Turn-State` 和 `reasoning.effort=low`，一次测票内带上游下发的 cookie | `host.model.execute`：走 CPR 自己的模型链并指定这个账号，用插件设置 `modeltraceClientKeyId` 里填的 Client Key（v0.1.12 起由用户配置，插件不再自建 Key 和“账号探测”分组；这个 Key 要能访问所有要测的账号，建议不绑分组；探测计入它的用量、受它的限额约束；不填则 ModelTrace 被拦截） |
 | 判定 | 第一次带回就被接受 → 正常；换过票后才被接受 → 疑似；每次都被换新票 → 降智；没发票、或负载均衡 cookie 变了 → 未判定 | 探测的模型概率 ≥ 50% 且最像它 → 正常；更像另一个模型且概率 ≥ 80%（至少 2 份有效回答）→ 降智；其余疑似；指纹库没有的模型 → 未判定。`gpt-6.1-sol` 按 `gpt-6-astra` 的指纹判定 |
 
 上游明确说自己过载（消息里有 overload）→ 疑似，计入状态条和正常率；测票遇到过载会间隔 1 秒再测，最多再测 3 次，有一次拿到回答就按那次判定，4 次都过载 → 降智（剩余时间不够再测时按单次过载记疑似）；其他失败（包括没有 overload 字样的 503）是探测失败、未判定。上游的模型名是它自己的说法，只记录、不参与判定。票是会话凭据，只存长度和 sha256 前 8 位。

@@ -109,7 +109,7 @@ async function start() {
           测票：直连 Codex 后端，走账号在 CPR 绑定的代理，拿一张票再最多带回 3 次，看上游是否接受。
         </template>
         <template v-else>
-          ModelTrace：经 CPR 的模型链（指定这个账号）发 3 道“选整数”的题，按数字分布和指纹库比对；计入插件 Key 的用量。
+          ModelTrace：经 CPR 的模型链（指定这个账号）发 3 道“选整数”的题，按数字分布和指纹库比对；用插件设置里配置的 Client Key，计入它的用量。
         </template>
       </p>
       <div v-if="plan?.blockers.length && !run" class="flex flex-col gap-1 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-warning-on-container">

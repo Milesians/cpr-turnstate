@@ -369,12 +369,10 @@ impl Groups {
         lock(&self.state).status.clone()
     }
 
-    /// 插件自己维护成员的分组（新建的分组和 ModelTrace 用的分组），不能选作现有分组
+    /// 插件新建的分组，不能选作现有分组
     #[must_use]
-    pub fn plugin_group_ids(&self, runner: &Runner) -> BTreeSet<String> {
-        let mut ids = lock(&self.state).owned_group_ids.clone();
-        ids.extend(runner.probe_group_id());
-        ids
+    pub fn plugin_group_ids(&self) -> BTreeSet<String> {
+        lock(&self.state).owned_group_ids.clone()
     }
 
     /// 每轮维护调用：只处理刚测完（和上次失败）的账号；启动后第一次核对全部账号

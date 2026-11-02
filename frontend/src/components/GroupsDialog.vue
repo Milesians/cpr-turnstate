@@ -42,7 +42,7 @@ const error = ref('')
 const notice = ref('')
 
 const groupOptions = computed(() => cprGroups.value.map(g => ({
-  label: g.plugin ? `${g.name}（插件维护，不能选）` : g.enabled ? g.name : `${g.name}（已停用）`,
+  label: g.plugin ? `${g.name}（插件新建，不能选）` : g.enabled ? g.name : `${g.name}（已停用）`,
   value: g.id,
   disabled: g.plugin,
 })))

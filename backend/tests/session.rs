@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use support::{FakeHost, HttpReply, Peer, ticket_reply};
 
 const ENABLED: fn() -> Value = || json!({"probeEnabled": true, "fingerprintSyncHours": 0});
+/// ModelTrace 需要用户配置的 Client Key ID
+const WITH_KEY: fn() -> Value = || json!({"probeEnabled": true, "fingerprintSyncHours": 0, "modeltraceClientKeyId": "key_mine"});
 
 fn telegram_config() -> Value {
     json!({"probeEnabled":true,"fingerprintSyncHours":0,"telegramEnabled":true,
@@ -561,7 +563,7 @@ async fn modeltrace_goes_through_the_cpr_model_chain_one_challenge_at_a_time() {
     for seed in 0..3 {
         host.models.push_back(Ok(numbers(320, seed)));
     }
-    let mut peer = Peer::start(ENABLED()).await;
+    let mut peer = Peer::start(WITH_KEY()).await;
     let (status, body) = peer
         .api(
             "POST",
@@ -579,7 +581,13 @@ async fn modeltrace_goes_through_the_cpr_model_chain_one_challenge_at_a_time() {
         run.get("pending").is_none(),
         "prompts must not reach the page"
     );
-    assert!(host.calls.iter().any(|c| c == "host.keys.ensure"));
+    assert!(
+        !host
+            .calls
+            .iter()
+            .any(|c| c == "host.keys.ensure" || c.starts_with("host.groups.")),
+        "the plugin creates no key or group of its own"
+    );
 
     // 同账号串行：进行中时再发起会被拦
     let (status, busy) = peer
@@ -628,7 +636,7 @@ async fn modeltrace_goes_through_the_cpr_model_chain_one_challenge_at_a_time() {
 
     assert_eq!(host.seen_models.len(), 3);
     let (params, body) = &host.seen_models[0];
-    assert_eq!(params["client_key_id"], "key-1");
+    assert_eq!(params["client_key_id"], "key_mine");
     assert_eq!(params["account_id"], "acct_a");
     assert_eq!(params["provider"], "openai");
     assert_eq!(params["protocol"], "openai");
@@ -855,7 +863,7 @@ async fn modeltrace_is_manual_only_and_old_schedules_are_ignored() {
     let mut host = FakeHost::new(&["acct_a"]);
     host.state.insert(("settings".into(),"schedules".into()), (json!({"accounts":{"acct_a":{"modeltrace":{"enabled":true,"model":"gpt-6-astra","interval_minutes":60}}}}),1));
     host.models.push_back(Ok(numbers(320, 0)));
-    let mut peer = Peer::start(ENABLED()).await;
+    let mut peer = Peer::start(WITH_KEY()).await;
     for _ in 0..3 {
         peer.reconcile(&mut host).await;
     }
@@ -1099,4 +1107,47 @@ async fn invalid_batch_configuration_changes_nothing() {
         assert!(host.get("settings", "schedules").is_none());
     }
     assert!(!host.calls.iter().any(|c| c == "host.state.put"));
+}
+
+#[tokio::test]
+async fn modeltrace_needs_a_configured_client_key_and_creates_nothing() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    let mut peer = Peer::start(ENABLED()).await;
+    peer.reconcile(&mut host).await;
+    let (status, plan) = peer
+        .api(
+            "POST",
+            "api/plan",
+            "",
+            Some(json!({"account_id":"acct_a","method":"modeltrace","model":"gpt-6-astra"})),
+            &mut host,
+        )
+        .await;
+    assert_eq!(status, 200, "{plan}");
+    assert!(plan.to_string().contains("no_client_key"), "{plan}");
+    let (status, body) = peer
+        .api(
+            "POST",
+            "api/probe",
+            "",
+            Some(json!({"account_id":"acct_a","method":"modeltrace","model":"gpt-6-astra"})),
+            &mut host,
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["blockers"][0]["code"], "no_client_key");
+    let (_, models) = peer.api("GET", "api/models", "", None, &mut host).await;
+    assert!(
+        models["cpr"].is_null(),
+        "no key, no CPR model list: {models}"
+    );
+    assert!(host.seen_models.is_empty());
+    assert!(
+        !host
+            .calls
+            .iter()
+            .any(|c| c == "host.keys.ensure" || c.starts_with("host.groups.")),
+        "{:?}",
+        host.calls
+    );
 }

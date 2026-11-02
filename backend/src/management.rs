@@ -204,7 +204,7 @@ async fn cpr_groups(app: &App, host: &HostClient) -> Result<Value, ApiError> {
         .groups()
         .await
         .map_err(|reason| ApiError::new(502, "admin_failed", reason))?;
-    let forbidden = app.groups.plugin_group_ids(&app.runner);
+    let forbidden = app.groups.plugin_group_ids();
     let groups: Vec<Value> = groups
         .into_iter()
         .map(|g| {
@@ -237,7 +237,7 @@ async fn save_groups(
     } else {
         None
     };
-    let forbidden = app.groups.plugin_group_ids(&app.runner);
+    let forbidden = app.groups.plugin_group_ids();
     let existing = crate::groups::Existing {
         groups: groups.as_deref(),
         forbidden: &forbidden,
@@ -573,7 +573,7 @@ async fn models(app: &App, host: &HostClient) -> Result<Value, ApiError> {
         .map(|m| json!({"id": m.id, "display_name": m.display_name, "family": m.family_name}))
         .collect();
     // 经 CPR 能请求的模型（ModelTrace 走 CPR 的模型链，名字以它为准）；失败不影响其他
-    let cpr = match app.runner.ensure_resources(host).await {
+    let cpr = match app.runner.client_key() {
         Ok(key) => host
             .call(
                 "host.models.list",
@@ -637,7 +637,7 @@ async fn plan(app: &App, host: &HostClient, req: ProbeRequest) -> Result<Value, 
             })
         }
         Method::Modeltrace => json!({
-            "path": "经 CPR 自己的模型链（指定这个账号），用插件维护的 Key“账号探测（ModelTrace）”，计入它的用量",
+            "path": "经 CPR 自己的模型链（指定这个账号），用插件设置里配置的 Client Key，计入它的用量",
             "body": {"model": req.model, "input": "‹一道“选 N 个 1 到 355 的整数”的题›", "store": false},
             "count": format!("{} 道题，依次发送", crate::modeltrace::CHALLENGE_COUNT),
             "fingerprint": crate::fingerprint::fingerprint_of(&req.model),

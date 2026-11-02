@@ -93,15 +93,6 @@ impl Scheduler {
                 break;
             }
         }
-        if let Err(error) = runner.sync_members(host, &accounts).await {
-            host::log(
-                host,
-                "probe_key_sync_failed",
-                LogLevel::Warn,
-                json!({"code": format!("{:?}", error.code)}),
-            )
-            .await;
-        }
         for (account_id, run_id) in runner.stale() {
             runner.abandon(host, &account_id, &run_id).await?;
         }

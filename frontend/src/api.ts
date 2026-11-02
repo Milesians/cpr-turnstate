@@ -300,7 +300,7 @@ export interface CprGroup {
   name: string
   color: string
   enabled: boolean
-  /** 插件自己维护成员的分组，不能选 */
+  /** 插件新建的分组，不能选 */
   plugin: boolean
 }
 

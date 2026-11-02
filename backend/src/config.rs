@@ -19,6 +19,8 @@ pub struct Config {
     /// 调整现有分组时用的 CPR 管理接口地址与部署级管理 API Key（敏感字段）
     pub cpr_admin_url: String,
     pub cpr_admin_api_key: String,
+    /// ModelTrace 走 CPR 模型链用的 Client Key ID（不是 Key 本身）
+    pub modeltrace_client_key_id: String,
 }
 
 impl Default for Config {
@@ -33,6 +35,7 @@ impl Default for Config {
             telegram_thread_id: 0,
             cpr_admin_url: String::new(),
             cpr_admin_api_key: String::new(),
+            modeltrace_client_key_id: String::new(),
         }
     }
 }

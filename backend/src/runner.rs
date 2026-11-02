@@ -17,7 +17,6 @@ use gateway_plugin_sdk::{
             ModelOperation,
         },
         model::{CanonicalEvent, ContentKind},
-        resources::{GroupEnsureRequest, GroupMembersChange, KeyEnsureRequest},
     },
     client::HostClient,
 };
@@ -37,7 +36,6 @@ use crate::verdict::{UpstreamError, one_line};
 pub const MAX_CONCURRENT: usize = 8;
 /// 进行中的记录超过这么久没有完成，就当作中断（页面关了或插件重启）
 pub const STALE_MS: i64 = 20 * 60 * 1000;
-const RESOURCE_KEY: &str = "probe";
 const MAX_ERROR_BODY: usize = 4096;
 
 /// 现在不能发真实探测的原因
@@ -83,12 +81,8 @@ pub struct Runner {
     pub bank: BankStore,
     /// 账号 → 正在运行的记录 ID 与开始时间；同账号串行
     busy: Mutex<HashMap<String, (String, i64)>>,
-    /// ModelTrace 用的 Client Key ID
-    key: Mutex<Option<String>>,
     /// 测完测票、当前判定可能变了的账号；自动分组取走后只重读这些
     turnstate_finished: Mutex<HashSet<String>>,
-    /// ModelTrace 用的插件分组在 CPR 里的 ID
-    probe_group: Mutex<Option<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -108,16 +102,8 @@ impl Runner {
             config,
             bank: BankStore::default(),
             busy: Mutex::new(HashMap::new()),
-            key: Mutex::new(None),
             turnstate_finished: Mutex::new(HashSet::new()),
-            probe_group: Mutex::new(None),
         }
-    }
-
-    /// ModelTrace 用的插件分组的 ID（建过之后才有）
-    #[must_use]
-    pub fn probe_group_id(&self) -> Option<String> {
-        lock(&self.probe_group).clone()
     }
 
     /// 取走上次以来测完测票的账号
@@ -217,6 +203,11 @@ impl Runner {
                 .is_empty()
         {
             out.push(Blocker::new("no_credentials", "账号缺少 ChatGPT 账号 ID"));
+        }
+        if method == Method::Modeltrace
+            && let Err(reason) = self.client_key()
+        {
+            out.push(Blocker::new("no_client_key", reason));
         }
         if !codex::valid_model(model) {
             out.push(Blocker::new("invalid_model", "请选择要探测的模型"));
@@ -348,9 +339,6 @@ impl Runner {
                         challenges,
                         completions: Vec::new(),
                     });
-                    if let Err(error) = self.prepare_key(host, &account.account_id).await {
-                        finish(&mut run, Some(error));
-                    }
                     store::save(host, &run, None).await?;
                 }
             }
@@ -424,7 +412,9 @@ impl Runner {
         let Some(challenge) = pending.challenges.get(index) else {
             return Err(UpstreamError::new("other", "题目已答完"));
         };
-        let key = self.prepare_key(host, &run.account_id).await?;
+        let key = self
+            .client_key()
+            .map_err(|reason| UpstreamError::new("blocked", reason))?;
         let completion = complete(host, &key, &run.account_id, &run.model, &challenge.prompt)
             .await
             .map_err(|e| UpstreamError {
@@ -482,89 +472,20 @@ impl Runner {
         Ok(())
     }
 
-    /// ModelTrace 用的分组和 Key：插件自己建，账号进分组后 Key 才能指定它
-    async fn prepare_key(
-        &self,
-        host: &HostClient,
-        account_id: &str,
-    ) -> Result<String, UpstreamError> {
-        let key = self.ensure_resources(host).await.map_err(|e| {
-            UpstreamError::new(
-                "host",
-                format!("准备探测用的 Key 失败：{}", one_line(&e.message, 200)),
-            )
-        })?;
-        host.change_group_members(GroupMembersChange {
-            resource_key: RESOURCE_KEY.into(),
-            add: vec![account_id.to_owned()],
-            remove: Vec::new(),
-        })
-        .await
-        .map_err(|e| {
-            UpstreamError::new(
-                "host",
-                format!("把账号加入探测分组失败：{}", one_line(&e.message, 200)),
-            )
-        })?;
-        Ok(key)
-    }
-
-    /// 确保探测分组与 Key 存在，返回 Key ID
+    /// ModelTrace 走 CPR 模型链用的 Client Key：用户在插件设置里填（用户 2026-11-02 去掉了插件自建的
+    /// Key 和分组）。只是 ID，不是 Key 本身
     ///
     /// # Errors
-    /// 宿主回调失败时返回错误
-    pub async fn ensure_resources(&self, host: &HostClient) -> Result<String, PluginFault> {
-        if let Some(key) = lock(&self.key).clone() {
-            return Ok(key);
+    /// 没填或格式不对时返回原因
+    pub fn client_key(&self) -> Result<String, &'static str> {
+        let key = self.config.modeltrace_client_key_id.trim();
+        if key.is_empty() {
+            return Err("ModelTrace 需要先在插件设置里填写使用的 Client Key ID");
         }
-        let group = host
-            .ensure_group(GroupEnsureRequest {
-                resource_key: RESOURCE_KEY.into(),
-                name: "账号探测".into(),
-                color: "#6366F1FF".into(),
-                description: Some("账号探测插件的 ModelTrace 用，成员由插件维护".into()),
-            })
-            .await?;
-        *lock(&self.probe_group) = Some(group.id);
-        let key = host
-            .ensure_key(KeyEnsureRequest {
-                resource_key: RESOURCE_KEY.into(),
-                name: "账号探测（ModelTrace）".into(),
-                group_resource_keys: vec![RESOURCE_KEY.into()],
-                max_concurrency: MAX_CONCURRENT as u64,
-                requests_per_minute: 0,
-                daily_limit_usd: "0".into(),
-                weekly_limit_usd: "0".into(),
-            })
-            .await?;
-        *lock(&self.key) = Some(key.id.clone());
-        Ok(key.id)
-    }
-
-    /// 把账号补进探测分组，每次最多 200 个
-    ///
-    /// # Errors
-    /// 宿主回调失败时返回错误
-    pub async fn sync_members(
-        &self,
-        host: &HostClient,
-        accounts: &[AuthRuntimeAccount],
-    ) -> Result<(), PluginFault> {
-        self.ensure_resources(host).await?;
-        let ids: Vec<String> = accounts
-            .iter()
-            .filter(|a| supported(a))
-            .map(|a| a.account_id.clone())
-            .collect();
-        for chunk in ids.chunks(200) {
-            host.change_group_members(GroupMembersChange {
-                resource_key: RESOURCE_KEY.into(),
-                add: chunk.to_vec(),
-                remove: Vec::new(),
-            })
-            .await?;
+        if key.len() > 128 || key.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err("插件设置里的 ModelTrace Client Key ID 格式不对");
         }
-        Ok(())
+        Ok(key.to_owned())
     }
 
     async fn turnstate(
