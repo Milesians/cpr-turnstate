@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { OverviewAccount, Range } from '../src/api.ts'
-import { accountState, cellState, expand, fitSpans, pendingChange, pendingLabel, severity, total, worst } from '../src/timeline.ts'
+import { accountState, blockedLabel, cellState, expand, fitSpans, isBlocked, needsAttention, pendingChange, pendingLabel, rank, severity, total, worst } from '../src/timeline.ts'
 
 const range: Range = { hours: 24, start_ms: 0, slot_ms: 900000, slots: 96 }
 
@@ -53,6 +53,7 @@ function account(): OverviewAccount {
       level: 'ok', model: 'm', candidate: null, streak: 0, changed_ms: 100, last_run_id: 'confirmed',
       notification_pending: 0, notification_error: null, notifications_dropped: 0,
     },
+    blocked: null,
     schedule: { turnstate: schedule, modeltrace: schedule },
     last_attempt: null,
     latest: { turnstate: null, modeltrace: null },
@@ -99,4 +100,20 @@ test('pending change shows whenever the candidate differs from the verdict', () 
 test('problems sort first', () => {
   const order = (['ok', 'empty', 'degraded', 'suspect', 'unknown'] as const).slice().sort((x, y) => severity[x] - severity[y])
   assert.deepEqual(order, ['degraded', 'suspect', 'unknown', 'ok', 'empty'])
+})
+
+test('a confirmed block sorts after suspect and before unknown, without changing the verdict', () => {
+  const a = account()
+  assert.equal(rank(a), severity.ok)
+  a.blocked = { code: 'credential_state', message: '凭据已失效', since_ms: 1, confirmed_ms: 0 }
+  assert.equal(isBlocked(a), false, 'not confirmed yet')
+  assert.equal(needsAttention(a), false)
+  a.blocked.confirmed_ms = 2
+  assert.equal(isBlocked(a), true)
+  assert.equal(needsAttention(a), true)
+  assert.equal(accountState(a), 'ok', 'blocking is not a verdict')
+  assert(rank(a) > severity.suspect && rank(a) < severity.unknown)
+  a.health!.level = 'degraded'
+  assert.equal(rank(a), severity.degraded, 'degraded stays first')
+  assert.equal(blockedLabel('token_expired'), '令牌过期')
 })

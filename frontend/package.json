@@ -11,7 +11,7 @@
     "build": "vue-tsc -b && vite build",
     "dev": "vite --host 127.0.0.1",
     "typecheck": "vue-tsc -b --pretty false",
-    "test": "node --experimental-strip-types --test tests/*.test.ts"
+    "test": "TZ=America/Los_Angeles node --experimental-strip-types --test tests/*.test.ts"
   },
   "dependencies": {
     "@codex-proxy/ui": "github:zyycn/codex-proxy-ui#v0.7.0",

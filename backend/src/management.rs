@@ -419,6 +419,7 @@ async fn overview(app: &App, host: &HostClient, range: Range) -> Result<Value, A
             |from: i64| Rate::from(series::between(from, i64::MAX, &t.runs, &t.buckets));
         let mut view = serde_json::to_value(AccountView::new(app, a)).unwrap_or(Value::Null);
         view["health"] = json!(turnstate.health);
+        view["blocked"] = json!(turnstate.blocked);
         view["schedule"] = json!(schedule);
         view["last_attempt"] = json!(app.scheduler.last(&a.account_id, Method::Turnstate));
         view["latest"] = json!({
@@ -483,8 +484,12 @@ async fn account_detail(app: &App, host: &HostClient, id: &str) -> Result<Value,
     let schedule = schedules.accounts.get(id).cloned().unwrap_or_default();
     let now = now_ms();
     let mut methods = serde_json::Map::new();
+    let mut blocked = None;
     for method in Method::ALL {
         let view = store::history_view(host, id, method).await?;
+        if method == Method::Turnstate {
+            blocked.clone_from(&view.blocked);
+        }
         let daily = series::daily(store::HISTORY_DAYS, now, &view.runs, &view.buckets);
         // 更早的只剩次数：页面据此说明逐条记录从什么时候开始
         let raw_since = (!view.buckets.is_empty())
@@ -505,6 +510,7 @@ async fn account_detail(app: &App, host: &HostClient, id: &str) -> Result<Value,
     }
     let mut view = serde_json::to_value(AccountView::new(app, &account)).unwrap_or(Value::Null);
     view["methods"] = Value::Object(methods);
+    view["blocked"] = json!(blocked);
     Ok(json!({"account": view, "config": {"probe_enabled": app.runner.config.probe_enabled}}))
 }
 

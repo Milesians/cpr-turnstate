@@ -4,9 +4,9 @@ import { ZButton, ZDialog, ZEmpty, ZInputNumber, ZSegmented, ZSelect, ZSwitch, Z
 import { ArrowLeft } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { api, methodLabel, methods, scheduledMethods } from '../api'
-import { ago, dateTime, levelLabel, levelTag, rate, statusLabel } from '../format'
+import { ago, dateTime, levelLabel, levelTag, rate, span, statusLabel } from '../format'
 import { defaultModels } from '../probe-models'
-import { judged, merge } from '../timeline'
+import { blockedLabel, judged, merge } from '../timeline'
 import ProbeDialog from './ProbeDialog.vue'
 import RunView from './RunView.vue'
 import TrendChart from './TrendChart.vue'
@@ -133,6 +133,15 @@ onMounted(async () => {
     <div v-if="!detail && !error" class="monitor-loading">正在读取…</div>
 
     <template v-if="detail">
+      <section v-if="detail.account.blocked" class="blocked-banner" :data-confirmed="!!detail.account.blocked.confirmed_ms" role="status">
+        <strong>{{ detail.account.blocked.confirmed_ms ? '探测受阻' : '探测暂时受阻' }} · {{ blockedLabel(detail.account.blocked.code) }}</strong>
+        <span>{{ detail.account.blocked.message }}</span>
+        <span class="text-cp-xs text-cp-text-secondary">
+          从 {{ dateTime(detail.account.blocked.since_ms) }} 起，已持续 {{ span(Date.now() - detail.account.blocked.since_ms) }}。
+          {{ detail.account.blocked.confirmed_ms ? `${dateTime(detail.account.blocked.confirmed_ms)} 已确认并发送 TG 通知；原因解除后自动恢复并再通知一次。` : '持续 30 分钟会确认并发送 TG 通知。' }}
+          这不是降智判定，下面的当前判定保持不变。
+        </span>
+      </section>
       <section class="verdict-panel" :data-state="health?.level ?? 'empty'" aria-live="polite">
         <div class="verdict-main">
           <span class="text-cp-xs text-cp-text-tertiary">测票当前判定</span>

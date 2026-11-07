@@ -4,6 +4,10 @@
 //! 只有测票能自动探测，ModelTrace 只手动探测。
 //! 同账号串行，全局最多 [`MAX_CONCURRENT`] 个；忙碌的下一轮重试，其他拦截 10 分钟后重试。
 //! 上游拒绝后不冷却。
+//!
+//! 所有启用的账号，每轮按 CPR 给的账号状态判断是否因为账号本身的问题受阻（凭据失效、
+//! 令牌过期等），和开没开自动测票、真实探测无关：持续 [`BLOCK_CONFIRM_MS`] 才确认并发 TG 通知，
+//! 解除时（确认过的）再通知一次。受阻不是判定，不改当前判定。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -18,8 +22,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::clock::now_ms;
+use crate::health::{BLOCK_CONFIRM_MS, Blocked, NoticeKind};
 use crate::host;
-use crate::runner::{Blocker, MAX_CONCURRENT, Runner, STALE_MS, supported};
+use crate::runner::{Blocker, MAX_CONCURRENT, Runner, STALE_MS, account_blockers, supported};
 use crate::store::{self, Method, Status};
 
 const BLOCKED_RETRY_MS: i64 = 10 * 60 * 1000;
@@ -42,6 +47,8 @@ struct State {
     retry_at: HashMap<(String, Method), i64>,
     last: HashMap<(String, Method), LastAttempt>,
     recovered_ms: i64,
+    /// 各账号记着的受阻状态，启动后第一次用到时从历史读；只在变化时写回
+    blocked: HashMap<String, Option<Blocked>>,
 }
 
 #[derive(Default)]
@@ -84,6 +91,8 @@ impl Scheduler {
             .sync_if_due(host, runner.config.fingerprint_sync_hours)
             .await;
         let accounts = host::openai_accounts(host).await?;
+        // 先记受阻，确认的通知这一轮就能发出去
+        self.track_blocked(runner, host, &accounts).await;
         let mut delivered = 0;
         for account in &accounts {
             if crate::telegram::dispatch(host, &runner.config, account).await {
@@ -250,6 +259,102 @@ impl Scheduler {
             lock(&self.state).last_started.insert(key, at);
         }
         Ok(at)
+    }
+
+    /// 受阻状态的下一步：返回新状态（`None` 表示没变化）和要发的通知
+    fn next_blocked(
+        known: Option<&Blocked>,
+        current: Option<&Blocker>,
+        now: i64,
+    ) -> Option<(Option<Blocked>, Option<NoticeKind>)> {
+        match (known, current) {
+            (None, None) => None,
+            (None, Some(b)) => Some((
+                Some(Blocked {
+                    code: b.code.to_owned(),
+                    message: b.message.clone(),
+                    since_ms: now,
+                    confirmed_ms: 0,
+                }),
+                None,
+            )),
+            (Some(k), Some(b)) => {
+                let changed = k.code != b.code || k.message != b.message;
+                let confirm = k.confirmed_ms == 0 && now - k.since_ms >= BLOCK_CONFIRM_MS;
+                if !changed && !confirm {
+                    return None;
+                }
+                // 原因换了也还是同一段受阻，从最初开始算
+                let next = Blocked {
+                    code: b.code.to_owned(),
+                    message: b.message.clone(),
+                    since_ms: k.since_ms,
+                    confirmed_ms: if confirm { now } else { k.confirmed_ms },
+                };
+                Some((Some(next), confirm.then_some(NoticeKind::Blocked)))
+            }
+            (Some(k), None) => Some((None, (k.confirmed_ms > 0).then_some(NoticeKind::Unblocked))),
+        }
+    }
+
+    /// 记下开着自动测票的账号是否因为账号本身的问题受阻。读写失败只记日志，下一轮再试
+    async fn track_blocked(
+        &self,
+        runner: &Runner,
+        host: &HostClient,
+        accounts: &[AuthRuntimeAccount],
+    ) {
+        let now = now_ms();
+        for account in accounts.iter().filter(|a| supported(a)) {
+            let id = &account.account_id;
+            // 所有启用的账号都看（和开没开自动测票、真实探测无关）；在 CPR 停用的不算，也不发恢复通知
+            let monitored = account.enabled;
+            let current = if monitored {
+                account_blockers(account, Method::Turnstate, now)
+                    .into_iter()
+                    .next()
+            } else {
+                None
+            };
+            let cached = lock(&self.state).blocked.get(id).cloned();
+            // 启动后每个账号读一次历史，之后只看内存
+            let known = match cached {
+                Some(known) => known,
+                None => match store::blocked(host, id).await {
+                    Ok(known) => known,
+                    Err(_) => continue,
+                },
+            };
+            let Some((next, notice)) = Self::next_blocked(known.as_ref(), current.as_ref(), now)
+            else {
+                lock(&self.state).blocked.insert(id.clone(), known);
+                continue;
+            };
+            // 不在监控时清掉旧状态但不通知
+            let notice = notice.filter(|_| monitored);
+            match store::set_blocked(
+                host,
+                id,
+                next.clone(),
+                notice,
+                runner.config.telegram_enabled,
+            )
+            .await
+            {
+                Ok(()) => {
+                    lock(&self.state).blocked.insert(id.clone(), next);
+                }
+                Err(error) => {
+                    host::log(
+                        host,
+                        "blocked_track_failed",
+                        LogLevel::Warn,
+                        json!({"code": format!("{:?}", error.code)}),
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     /// 插件重启后，历史里还“进行中”的记录不会再有人推进：超时的标成中断

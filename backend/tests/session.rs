@@ -1395,3 +1395,120 @@ async fn overview_stays_under_the_management_body_limit_for_busy_accounts() {
         );
     }
 }
+
+fn auto_turnstate(host: &mut FakeHost, account: &str) {
+    host.state.insert(
+        ("settings".into(), "schedules".into()),
+        (
+            json!({"accounts":{account:{"turnstate":{"enabled":true,"model":"gpt-6-astra","interval_minutes":60}}}}),
+            1,
+        ),
+    );
+}
+
+fn stored_blocked(host: &FakeHost) -> Value {
+    host.get("history", "acct_a/turnstate")
+        .map_or(Value::Null, |h| h["blocked"].clone())
+}
+
+/// 自动测票因为凭据失效发不出去：不判降智，持续 30 分钟才确认并发 TG，解除后再通知一次
+#[tokio::test]
+async fn blocked_auto_probes_are_confirmed_notified_and_recovered() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    legacy_health(&mut host, "ok");
+    auto_turnstate(&mut host, "acct_a");
+    host.accounts[0]["credential_state"] = json!("expired");
+    let mut peer = Peer::start(telegram_config()).await;
+
+    peer.reconcile(&mut host).await;
+    let blocked = stored_blocked(&host);
+    assert_eq!(blocked["code"], "credential_state");
+    assert_eq!(blocked["confirmed_ms"], 0);
+    assert!(
+        host.seen_http.is_empty(),
+        "a blocked account must not be probed"
+    );
+    assert!(host.seen_public_http.is_empty(), "not confirmed yet");
+    let (_, overview) = peer.api("GET", "api/overview", "", None, &mut host).await;
+    assert_eq!(
+        overview["accounts"][0]["blocked"]["code"],
+        "credential_state"
+    );
+    assert_eq!(overview["accounts"][0]["health"]["level"], "ok");
+
+    // 已经受阻 31 分钟（插件重启过，从历史读回）
+    let now = cpr_account_probe::clock::now_ms();
+    let key = ("history".to_owned(), "acct_a/turnstate".to_owned());
+    host.state.get_mut(&key).unwrap().0["blocked"]["since_ms"] = json!(now - 31 * 60_000);
+    drop(peer);
+    let mut peer = Peer::start(telegram_config()).await;
+    host.public_http
+        .push_back(telegram_reply(200, json!({"ok":true,"result":{}})));
+    peer.reconcile(&mut host).await;
+    assert!(stored_blocked(&host)["confirmed_ms"].as_i64().unwrap() > 0);
+    assert_eq!(host.seen_public_bodies.len(), 1);
+    let text = host.seen_public_bodies[0]["text"].as_str().unwrap();
+    assert!(text.contains("账号凭据异常"), "{text}");
+    assert!(text.contains("凭据已失效"), "{text}");
+    assert!(
+        text.contains("这不是降智判定；当前判定保持“正常”"),
+        "{text}"
+    );
+    assert!(text.contains("邮箱：acct_a@example.com"), "{text}");
+    // 确认后不重复通知
+    peer.reconcile(&mut host).await;
+    assert_eq!(host.seen_public_bodies.len(), 1);
+    // 当前判定没变
+    let (_, detail) = peer
+        .api("GET", "api/account", "id=acct_a", None, &mut host)
+        .await;
+    assert_eq!(
+        detail["account"]["methods"]["turnstate"]["health"]["level"],
+        "ok"
+    );
+    assert_eq!(detail["account"]["blocked"]["code"], "credential_state");
+
+    // CPR 刷新成功：解除并通知
+    host.accounts[0]["credential_state"] = json!("ready");
+    host.public_http
+        .push_back(telegram_reply(200, json!({"ok":true,"result":{}})));
+    peer.reconcile(&mut host).await;
+    assert!(stored_blocked(&host).is_null());
+    assert_eq!(host.seen_public_bodies.len(), 2);
+    let text = host.seen_public_bodies[1]["text"].as_str().unwrap();
+    assert!(text.contains("账号凭据已恢复"), "{text}");
+    assert!(text.contains("受阻时长："), "{text}");
+}
+
+/// 一闪而过的令牌过期不通知；没开自动测票的账号也跟踪；在 CPR 停用的账号不算
+#[tokio::test]
+async fn short_or_unmonitored_blocks_stay_quiet() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    auto_turnstate(&mut host, "acct_a");
+    host.accounts[0]["access_token_expires_at_ms"] = json!(cpr_account_probe::clock::now_ms());
+    let mut peer = Peer::start(telegram_config()).await;
+    peer.reconcile(&mut host).await;
+    assert_eq!(stored_blocked(&host)["code"], "token_expired");
+    // CPR 几分钟内刷新了令牌
+    host.accounts[0]["access_token_expires_at_ms"] = json!(4_102_444_800_000_i64);
+    peer.reconcile(&mut host).await;
+    assert!(stored_blocked(&host).is_null());
+    assert!(host.seen_public_http.is_empty());
+
+    // 没开自动测票、也没开真实探测：凭据失效照样跟踪
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.accounts[0]["credential_state"] = json!("banned");
+    let mut peer = Peer::start(json!({"fingerprintSyncHours":0})).await;
+    peer.reconcile(&mut host).await;
+    assert_eq!(stored_blocked(&host)["code"], "credential_state");
+    let (_, overview) = peer.api("GET", "api/overview", "", None, &mut host).await;
+    assert_eq!(
+        overview["accounts"][0]["blocked"]["code"],
+        "credential_state"
+    );
+    // 在 CPR 停用：清掉，不通知
+    host.accounts[0]["enabled"] = json!(false);
+    peer.reconcile(&mut host).await;
+    assert!(stored_blocked(&host).is_null());
+    assert!(host.seen_public_http.is_empty());
+}

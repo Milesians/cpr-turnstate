@@ -115,9 +115,19 @@ export interface Account {
   running: string | null
 }
 
+/** 自动测票因为账号本身的问题（凭据失效、令牌过期等）发不出去；不是判定 */
+export interface Blocked {
+  code: string
+  message: string
+  since_ms: number
+  /** 持续 30 分钟后确认（并发 TG 通知）的时间；0 表示还没确认 */
+  confirmed_ms: number
+}
+
 /** 列表的一行：测票的当前判定、时间条与正常率，两种方法最近一次的结果 */
 export interface OverviewAccount extends Account {
   health: Health | null
+  blocked: Blocked | null
   schedule: Record<Method, Schedule>
   last_attempt: LastAttempt | null
   latest: Record<Method, Summary | null>
@@ -176,7 +186,7 @@ export interface Overview {
 }
 
 export interface AccountDetail {
-  account: Account & { methods: Record<Method, MethodDetail> }
+  account: Account & { methods: Record<Method, MethodDetail>, blocked: Blocked | null }
   config: { probe_enabled: boolean }
 }
 

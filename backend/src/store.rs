@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::fingerprint::Challenge;
-use crate::health::{Health, HealthView, Notification};
+use crate::health::{Blocked, Health, HealthView, NoticeKind, Notification};
 use crate::host;
 use crate::modeltrace::{Completion, ModelTraceResult};
 use crate::series::{self, Bucket, HOUR_MS};
@@ -210,6 +210,9 @@ struct History {
     /// 自动分组上次按哪个当前判定调整过；没有表示还没记下起点
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grouped_level: Option<Level>,
+    /// 自动测票正因为账号本身的问题受阻（只记在测票的历史里）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked: Option<Blocked>,
 }
 
 impl History {
@@ -270,21 +273,28 @@ impl History {
             if (from == Level::Unknown && to == Level::Ok) || (from.abnormal() && to.abnormal()) {
                 return;
             }
-            if self.notifications.len() == 32 {
-                self.notifications.remove(0);
-                self.notifications_dropped = self.notifications_dropped.saturating_add(1);
-            }
-            self.notifications.push(Notification {
+            self.enqueue(Notification {
                 id: summary.id.clone(),
+                kind: NoticeKind::Verdict,
                 from,
                 to,
                 model: summary.model.clone(),
                 at_ms: summary.finished_ms,
+                blocked: None,
                 attempts: 0,
                 retry_at_ms: 0,
                 last_error: None,
             });
         }
+    }
+
+    /// 放进 TG 待发队列；最多留 32 条，超出丢最旧的
+    fn enqueue(&mut self, notification: Notification) {
+        if self.notifications.len() == 32 {
+            self.notifications.remove(0);
+            self.notifications_dropped = self.notifications_dropped.saturating_add(1);
+        }
+        self.notifications.push(notification);
     }
 }
 
@@ -352,7 +362,7 @@ fn json_len<T: Serialize>(value: &T) -> Result<usize, PluginFault> {
 }
 
 /// 把历史压到 [`HISTORY_MAX_BYTES`] 以内：先从最旧的开始去掉没有详情的摘要的理由，
-/// 还不够就把最旧的逐条摘要并进按小时汇总（进行中的不动），次数不丢。返回被并掉、该删的详情 ID
+/// 还不够就把最旧的逐条摘要按 15 分钟并进汇总（进行中的不动），次数不丢。返回被并掉、该删的详情 ID
 fn fit(history: &mut History) -> Result<Vec<String>, PluginFault> {
     let mut expired = Vec::new();
     let mut len = json_len(history)?;
@@ -380,7 +390,8 @@ fn fit(history: &mut History) -> Result<Vec<String>, PluginFault> {
             let s = history.runs.remove(i);
             // 摘要本身加上分隔它的逗号；并进汇总多出的字节由下面的实际编码核对
             len = len.saturating_sub(json_len(&s)? + 1);
-            series::fold(&mut history.hours, &s);
+            // 逐条摘要都还在 48 小时内，按 15 分钟汇总，24 小时时间条的格子仍然准确
+            series::fold_fine(&mut history.hours, &s);
             if s.detail {
                 expired.push(s.id);
             }
@@ -579,6 +590,7 @@ pub struct HistoryView {
     pub runs: Vec<Summary>,
     pub buckets: Vec<Bucket>,
     pub health: Option<HealthView>,
+    pub blocked: Option<Blocked>,
 }
 
 /// 读一个账号一种方法的历史，按现在压缩（只在内存里，不写回）
@@ -597,7 +609,77 @@ pub async fn history_view(
         runs: history.runs,
         buckets: history.hours,
         health,
+        blocked: history.blocked,
     })
+}
+
+/// 账号测票现在记着的受阻状态
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn blocked(host: &HostClient, account_id: &str) -> Result<Option<Blocked>, PluginFault> {
+    Ok(history_record(host, account_id, Method::Turnstate)
+        .await?
+        .0
+        .blocked)
+}
+
+/// 改受阻状态；`notice` 有值且开着 TG 通知时同一次写入放进待发队列
+///
+/// # Errors
+/// 回调失败或一直冲突时返回错误
+pub async fn set_blocked(
+    host: &HostClient,
+    account_id: &str,
+    next: Option<Blocked>,
+    notice: Option<NoticeKind>,
+    notifications: bool,
+) -> Result<(), PluginFault> {
+    let key = history_key(account_id, Method::Turnstate);
+    for _ in 0..5 {
+        let (mut history, version) = history_record(host, account_id, Method::Turnstate).await?;
+        let previous = history.blocked.clone();
+        history.blocked.clone_from(&next);
+        if let (Some(kind), true) = (notice, notifications) {
+            let health = history
+                .health
+                .clone()
+                .unwrap_or_else(|| Health::from_history(&history.runs));
+            // 恢复通知带上受阻时的原因和开始时间
+            let about = next.clone().or(previous);
+            let at_ms = crate::clock::now_ms();
+            history.enqueue(Notification {
+                id: format!("{}-{at_ms}", kind_name(kind)),
+                kind,
+                from: health.level,
+                to: health.level,
+                model: health.model,
+                at_ms,
+                blocked: about,
+                attempts: 0,
+                retry_at_ms: 0,
+                last_error: None,
+            });
+        }
+        let mut expired = Vec::new();
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return delete_runs(host, expired).await,
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "探测历史被同时修改，请重试",
+    ))
+}
+
+const fn kind_name(kind: NoticeKind) -> &'static str {
+    match kind {
+        NoticeKind::Verdict => "verdict",
+        NoticeKind::Blocked => "blocked",
+        NoticeKind::Unblocked => "unblocked",
+    }
 }
 
 /// 账号测票的当前判定，和自动分组上次按哪个判定调整过

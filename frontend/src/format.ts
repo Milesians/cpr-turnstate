@@ -37,14 +37,17 @@ export function statusLabel(status: Status, level?: Level | null): string {
   return levelLabel[level ?? 'unknown']
 }
 
+/** 和后端的天、时间条边界一致，也和 TG 通知一致：一律按北京时间显示 */
+const TZ = 'Asia/Shanghai'
+
 export function dateTime(ms: number): string {
   if (!ms)
     return '—'
-  return new Date(ms).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  return new Date(ms).toLocaleString('zh-CN', { timeZone: TZ, hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 export function hour(ms: number): string {
-  return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' })
+  return new Date(ms).toLocaleTimeString('zh-CN', { timeZone: TZ, hour12: false, hour: '2-digit', minute: '2-digit' })
 }
 
 export function duration(ms: number): string {
@@ -87,7 +90,7 @@ export function ago(ms: number, now = Date.now()): string {
 }
 
 export function day(ms: number): string {
-  return new Date(ms).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+  return new Date(ms).toLocaleDateString('zh-CN', { timeZone: TZ, month: 'numeric', day: 'numeric' })
 }
 
 const countLabels = [['ok', '正常'], ['suspect', '疑似'], ['degraded', '降智'], ['unknown', '未判定'], ['failed', '失败'], ['running', '进行中']] as const
@@ -102,4 +105,15 @@ export function countItems(c: Counts): { state: keyof Counts, label: string, cou
   return countLabels
     .filter(([k]) => c[k])
     .map(([k, label]) => ({ state: k, label, count: c[k]! }))
+}
+
+/** 持续了多久：“25 分钟”“2 小时 5 分钟”“3 天 4 小时” */
+export function span(ms: number): string {
+  const minutes = Math.max(1, Math.floor(ms / 60_000))
+  if (minutes < 60)
+    return `${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24)
+    return minutes % 60 ? `${hours} 小时 ${minutes % 60} 分钟` : `${hours} 小时`
+  return hours % 24 ? `${Math.floor(hours / 24)} 天 ${hours % 24} 小时` : `${Math.floor(hours / 24)} 天`
 }

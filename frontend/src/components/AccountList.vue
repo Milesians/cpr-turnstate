@@ -3,9 +3,9 @@ import type { CellState } from '../timeline'
 import type { Overview, OverviewAccount } from '../api'
 import { ZButton, ZCheckbox, ZEmpty, ZInput, ZSegmented, ZSelect } from '@codex-proxy/ui'
 import { ChevronRight, Search } from '@lucide/vue'
-import { computed, ref } from 'vue'
-import { ago, rate } from '../format'
-import { accountState, pendingChange, pendingLabel, severity, stateLabel } from '../timeline'
+import { computed, ref, watch } from 'vue'
+import { ago, rate, span } from '../format'
+import { accountState, blockedLabel, isBlocked, needsAttention, pendingChange, pendingLabel, rank, stateLabel } from '../timeline'
 import ProbeStrip from './ProbeStrip.vue'
 
 const props = defineProps<{ overview: Overview | null, loading: boolean }>()
@@ -19,7 +19,7 @@ const hours = defineModel<string>('hours', { required: true })
 
 const MAX_BATCH = 200
 const search = ref('')
-const filter = ref<'all' | 'attention' | CellState>('all')
+const filter = ref<'all' | 'attention' | 'blocked' | CellState>('all')
 const plan = ref('')
 const sort = ref<'state' | 'name' | 'rate'>('state')
 const selectedIds = ref<string[]>([])
@@ -39,9 +39,10 @@ const filters = computed(() => {
   const count = (pred: (s: CellState) => boolean) => all.value.filter(a => pred(stateOf(a))).length
   return [
     { value: 'all', label: '全部', state: null, count: all.value.length },
-    { value: 'attention', label: '需要关注', state: 'degraded', count: count(s => s === 'degraded' || s === 'suspect') },
+    { value: 'attention', label: '需要关注', state: 'degraded', count: all.value.filter(needsAttention).length },
     { value: 'degraded', label: '降智', state: 'degraded', count: count(s => s === 'degraded') },
     { value: 'suspect', label: '疑似', state: 'suspect', count: count(s => s === 'suspect') },
+    { value: 'blocked', label: '探测受阻', state: 'blocked', count: all.value.filter(isBlocked).length },
     { value: 'ok', label: '正常', state: 'ok', count: count(s => s === 'ok') },
     { value: 'unknown', label: '未判定', state: 'unknown', count: count(s => s === 'unknown' || s === 'running') },
     { value: 'empty', label: '没有探测', state: 'empty', count: count(s => s === 'empty') },
@@ -50,11 +51,13 @@ const filters = computed(() => {
 
 function matches(a: OverviewAccount) {
   const s = stateOf(a)
-  if (filter.value === 'attention' && s !== 'degraded' && s !== 'suspect')
+  if (filter.value === 'attention' && !needsAttention(a))
+    return false
+  if (filter.value === 'blocked' && !isBlocked(a))
     return false
   if (filter.value === 'unknown' && s !== 'unknown' && s !== 'running')
     return false
-  if (!['all', 'attention', 'unknown'].includes(filter.value) && s !== filter.value)
+  if (!['all', 'attention', 'blocked', 'unknown'].includes(filter.value) && s !== filter.value)
     return false
   if (plan.value && planOf(a) !== plan.value)
     return false
@@ -67,7 +70,7 @@ const accounts = computed(() => all.value.filter(matches).sort((x, y) => {
   if (sort.value === 'rate')
     return rateValue(x) - rateValue(y) || name(x).localeCompare(name(y))
   if (sort.value === 'state')
-    return severity[stateOf(x)] - severity[stateOf(y)] || Number(!x.supported) - Number(!y.supported) || name(x).localeCompare(name(y))
+    return rank(x) - rank(y) || Number(!x.supported) - Number(!y.supported) || name(x).localeCompare(name(y))
   return name(x).localeCompare(name(y))
 }))
 
@@ -94,7 +97,8 @@ function keepVisible() {
   const visible = new Set(selectable.value)
   selectedIds.value = selectedIds.value.filter(id => visible.has(id))
 }
-defineExpose({ prune: () => { selectedIds.value = selectedIds.value.filter(id => all.value.some(a => a.id === id && a.supported)) } })
+// 每次拿到新列表后去掉已删除或不再支持探测的账号，否则批量配置会整批被拒
+watch(all, (list) => { selectedIds.value = selectedIds.value.filter(id => list.some(a => a.id === id && a.supported)) })
 
 function lastProbe(a: OverviewAccount) {
   const l = a.latest.turnstate
@@ -105,7 +109,20 @@ function pendingText(a: OverviewAccount) {
   return p && a.health ? pendingLabel(a.health.level, p.to, p.streak) : ''
 }
 /** 行内告警：自动探测被拦截、TG 通知发不出去 */
+/** 受阻：确认的醒目显示；还没满 30 分钟的作为提示 */
+function blockedText(a: OverviewAccount) {
+  const b = a.blocked
+  if (!b)
+    return ''
+  return `${blockedLabel(b.code)} · ${span((props.overview?.now_ms ?? Date.now()) - b.since_ms)}`
+}
+/** 已停用（不跟踪受阻）但凭据异常的账号也提示一下 */
+function credentialNote(a: OverviewAccount) {
+  return !a.blocked && a.supported && ['expired', 'banned', 'invalid'].includes(a.credential_state) ? `凭据 ${a.credential_state}` : ''
+}
 function warning(a: OverviewAccount): { text: string, detail: string } | null {
+  if (a.blocked)
+    return null
   const blockers = a.last_attempt?.blockers
   if (blockers?.length)
     return { text: '自动探测被拦截', detail: blockers.map(b => b.message).join('；') }
@@ -150,7 +167,7 @@ function schedule(a: OverviewAccount) {
     </div>
     <div v-if="loading && !overview" class="monitor-loading">正在读取探测记录…</div>
     <ZEmpty v-else-if="!accounts.length" class="py-12" :title="all.length ? '没有符合筛选的账号' : 'CPR 里还没有 OpenAI 账号'" />
-    <article v-for="a in accounts" :key="a.id" class="monitor-row" :data-account="a.id" :data-state="stateOf(a)">
+    <article v-for="a in accounts" :key="a.id" class="monitor-row" :data-account="a.id" :data-state="stateOf(a)" :data-blocked="isBlocked(a) || undefined">
       <ZCheckbox :model-value="selectedIds.includes(a.id)" :disabled="!a.supported || (selectedIds.length >= MAX_BATCH && !selectedIds.includes(a.id))" :aria-label="`选择 ${name(a)}`" @update:model-value="(v: boolean) => select(a.id, v)" />
       <button type="button" class="monitor-account" @click="emit('open', a.id)">
         <span class="account-name">
@@ -163,6 +180,8 @@ function schedule(a: OverviewAccount) {
           <span v-if="!a.supported">不支持</span>
           <span v-else-if="!a.enabled">已停用</span>
           <span v-else class="text-cp-text-tertiary">{{ lastProbe(a) ? `${lastProbe(a)}探测` : '还没探测' }} · {{ schedule(a) }}</span>
+          <span v-if="a.blocked" class="blocked-pill" :data-confirmed="isBlocked(a)" :title="`${a.blocked.message}${isBlocked(a) ? '' : '（持续 30 分钟会发 TG 通知）'}`">{{ isBlocked(a) ? '探测受阻' : '受阻' }} · {{ blockedText(a) }}</span>
+          <span v-else-if="credentialNote(a)" class="row-warning" title="账号已停用，不跟踪、不通知">{{ credentialNote(a) }}</span>
           <span v-if="warning(a)" class="row-warning" :title="warning(a)!.detail">{{ warning(a)!.text }}</span>
         </span>
       </button>
