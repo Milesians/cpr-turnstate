@@ -95,6 +95,43 @@ pub fn supported(account: &AuthRuntimeAccount) -> bool {
     account.provider_id == "openai" && account.authentication_kind == "oauth"
 }
 
+/// 账号本身的问题：凭据失效、令牌过期、缺少账号 ID。和探测开关、并发这类临时拦截不同，
+/// 它们不会自己消失（除非 CPR 刷新成功或有人处理），持续一段时间就要告诉人
+#[must_use]
+pub fn account_blockers(account: &AuthRuntimeAccount, method: Method, now: i64) -> Vec<Blocker> {
+    let mut out = Vec::new();
+    let state = account.credential_state.as_str();
+    if matches!(state, "expired" | "banned" | "invalid") {
+        let what = match state {
+            "expired" => {
+                "凭据已失效（CPR 标记为 expired，令牌可能已被上游作废），需要重新登录或等 CPR 刷新"
+            }
+            "banned" => "账号被封禁（CPR 标记为 banned）",
+            _ => "凭据无效（CPR 标记为 invalid），需要重新登录",
+        };
+        out.push(Blocker::new("credential_state", what));
+    }
+    if account
+        .access_token_expires_at_ms
+        .is_some_and(|exp| exp <= now + 30_000)
+    {
+        out.push(Blocker::new(
+            "token_expired",
+            "访问令牌已过期或即将过期。插件不刷新令牌（刷新令牌会轮换），等 CPR 自动刷新后再试",
+        ));
+    }
+    if method == Method::Turnstate
+        && account
+            .upstream_account_id
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    {
+        out.push(Blocker::new("no_credentials", "账号缺少 ChatGPT 账号 ID"));
+    }
+    out
+}
+
 impl Runner {
     #[must_use]
     pub fn new(config: Config) -> Self {
@@ -177,33 +214,7 @@ impl Runner {
                 "账号在 CPR 已停用：只探测启用中的账号",
             ));
         }
-        if matches!(
-            account.credential_state.as_str(),
-            "expired" | "banned" | "invalid"
-        ) {
-            out.push(Blocker::new(
-                "credential_state",
-                format!("账号凭据状态为 {}，不探测", account.credential_state),
-            ));
-        }
-        if account
-            .access_token_expires_at_ms
-            .is_some_and(|exp| exp <= now_ms() + 30_000)
-        {
-            out.push(Blocker::new(
-                "token_expired",
-                "访问令牌已过期或即将过期。插件不刷新令牌（刷新令牌会轮换），等 CPR 自动刷新后再试",
-            ));
-        }
-        if method == Method::Turnstate
-            && account
-                .upstream_account_id
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-        {
-            out.push(Blocker::new("no_credentials", "账号缺少 ChatGPT 账号 ID"));
-        }
+        out.extend(account_blockers(account, method, now_ms()));
         if method == Method::Modeltrace
             && let Err(reason) = self.client_key()
         {

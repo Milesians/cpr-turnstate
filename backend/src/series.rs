@@ -2,7 +2,8 @@
 //!
 //! 每个账号每种方法的历史由两部分组成，同一条探测只在其中一处：
 //! - 最近的逐条摘要（[`RAW_HOURS`] 小时内，或最近 [`RAW_KEEP`] 条），带判定理由，可点开详情
-//! - 更早的按小时汇总的次数（[`Bucket`]），保留 [`crate::store::HISTORY_DAYS`] 天，只有各判定的次数
+//! - 更早的按小时汇总的次数（[`Bucket`]），保留 [`crate::store::HISTORY_DAYS`] 天，只有各判定的次数。
+//!   探测特别频繁、48 小时内的逐条摘要也放不下时，最旧的按 15 分钟汇总，24 小时时间条的格子仍然准确
 //!
 //! 时间条、正常率和走势都按两部分合起来算，所以压缩旧记录不改变展示的次数。
 //! 时间按北京时间对齐（格子边界落在整点、整天）。
@@ -14,6 +15,8 @@ use crate::verdict::Level;
 
 pub const HOUR_MS: i64 = 3_600_000;
 pub const DAY_MS: i64 = 24 * HOUR_MS;
+/// 细汇总的粒度，和 24 小时时间条的格子一样
+pub const QUARTER_MS: i64 = 15 * 60_000;
 /// 北京时间相对 UTC 的偏移
 const OFFSET_MS: i64 = 8 * HOUR_MS;
 /// 逐条摘要保留的小时数；更早的并进按小时汇总
@@ -102,13 +105,32 @@ impl Counts {
     }
 }
 
-/// 一小时里压缩掉的探测次数
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+const fn sixty() -> u16 {
+    60
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_sixty(m: &u16) -> bool {
+    *m == 60
+}
+
+/// 一段时间（一小时，或 15 分钟）里压缩掉的探测次数
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bucket {
-    /// 这一小时的开始（毫秒）
+    /// 这段时间的开始（毫秒）
     pub at: i64,
+    /// 这段时间有几分钟；旧版只有一小时的
+    #[serde(rename = "m", default = "sixty", skip_serializing_if = "is_sixty")]
+    pub minutes: u16,
     #[serde(flatten)]
     pub counts: Counts,
+}
+
+impl Bucket {
+    #[must_use]
+    pub const fn end_ms(&self) -> i64 {
+        self.at + self.minutes as i64 * 60_000
+    }
 }
 
 /// 把 `t` 按北京时间向下对齐到 `step` 的整数倍
@@ -117,15 +139,33 @@ pub const fn floor(t: i64, step: i64) -> i64 {
     (t + OFFSET_MS).div_euclid(step) * step - OFFSET_MS
 }
 
-/// 并入一条摘要；`buckets` 按时间排列
+/// 按小时并入一条摘要；`buckets` 按开始时间（再按时长）排列
 pub fn fold(buckets: &mut Vec<Bucket>, s: &Summary) {
-    let at = floor(s.started_ms, HOUR_MS);
-    match buckets.binary_search_by_key(&at, |b| b.at) {
+    fold_into(buckets, s, HOUR_MS);
+}
+
+/// 按 15 分钟并入一条摘要：用于还在 24 小时时间条范围里的记录
+pub fn fold_fine(buckets: &mut Vec<Bucket>, s: &Summary) {
+    fold_into(buckets, s, QUARTER_MS);
+}
+
+fn fold_into(buckets: &mut Vec<Bucket>, s: &Summary, step: i64) {
+    let at = floor(s.started_ms, step);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let minutes = (step / 60_000) as u16;
+    match buckets.binary_search_by_key(&(at, minutes), |b| (b.at, b.minutes)) {
         Ok(i) => buckets[i].counts.add(s),
         Err(i) => {
             let mut counts = Counts::default();
             counts.add(s);
-            buckets.insert(i, Bucket { at, counts });
+            buckets.insert(
+                i,
+                Bucket {
+                    at,
+                    minutes,
+                    counts,
+                },
+            );
         }
     }
 }
@@ -193,7 +233,11 @@ pub fn strip(range: &Range, runs: &[Summary], buckets: &[Bucket]) -> Vec<Cell> {
         }
     }
     for b in buckets {
-        if let Some(i) = range.index(b.at) {
+        // 和范围起点部分重叠的也算进第一格，次数不漏
+        if b.end_ms() <= range.start_ms {
+            continue;
+        }
+        if let Some(i) = range.index(b.at.max(range.start_ms)) {
             cells[i].merge(&b.counts);
         }
     }
@@ -226,7 +270,7 @@ pub fn between(from: i64, to: i64, runs: &[Summary], buckets: &[Bucket]) -> Coun
 pub fn has_buckets(from: i64, to: i64, buckets: &[Bucket]) -> bool {
     buckets
         .iter()
-        .any(|b| b.at + HOUR_MS > from && b.at < to && !b.counts.is_empty())
+        .any(|b| b.end_ms() > from && b.at < to && !b.counts.is_empty())
 }
 
 /// 走势里的一天（北京时间）

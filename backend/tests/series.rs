@@ -113,3 +113,65 @@ fn daily_covers_thirty_beijing_days_ending_today() {
     assert_eq!(days.iter().map(|d| d.counts.total()).sum::<u32>(), 2);
     assert_eq!(series::RAW_HOURS, 48);
 }
+
+/// 探测极频繁时 24 小时内的记录被按 15 分钟汇总：仍落在原来的格子里，不挤到整点那一格
+#[test]
+fn fine_buckets_keep_their_quarter_hour_cell() {
+    let range = Range::new(24, NOW).unwrap();
+    let mut buckets = Vec::new();
+    // 50 分钟前那一刻
+    let at = NOW - 50 * 60_000;
+    series::fold_fine(
+        &mut buckets,
+        &summary(at, Status::Done, Some(Level::Degraded)),
+    );
+    assert_eq!(buckets[0].minutes, 15);
+    let cells = strip(&range, &[], &buckets);
+    assert_eq!(cells.len(), 1);
+    let cell_start = range.start_ms + cells[0].i as i64 * range.slot_ms;
+    assert!(
+        cell_start <= at && at < cell_start + range.slot_ms,
+        "probe moved to another cell"
+    );
+    assert!(has_buckets(at, at + 1, &buckets));
+    assert!(!has_buckets(buckets[0].end_ms(), NOW, &buckets));
+}
+
+/// 和范围起点部分重叠的小时汇总算进第一格，次数不漏
+#[test]
+fn a_bucket_overlapping_the_range_start_is_counted() {
+    let range = Range::new(24, NOW).unwrap();
+    let mut buckets = Vec::new();
+    // NOW 是 12:34:56，24 小时范围从前一天 12:45 开始；12:00 那一小时和起点部分重叠
+    let hour = floor(range.start_ms, HOUR_MS);
+    assert!(hour < range.start_ms);
+    fold(
+        &mut buckets,
+        &summary(hour + 60_000, Status::Done, Some(Level::Ok)),
+    );
+    let cells = strip(&range, &[], &buckets);
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].i, 0);
+    assert_eq!(cells[0].counts.ok, 1);
+    // 整个在范围外的不计
+    let mut old = Vec::new();
+    fold(
+        &mut old,
+        &summary(range.start_ms - 2 * HOUR_MS, Status::Done, Some(Level::Ok)),
+    );
+    assert!(strip(&range, &[], &old).is_empty());
+}
+
+/// v0.2.0 写的汇总没有时长字段，读出来是一小时；一小时的不写时长字段
+#[test]
+fn legacy_buckets_read_as_one_hour() {
+    let b: Bucket = serde_json::from_value(serde_json::json!({"at": 0, "ok": 2})).unwrap();
+    assert_eq!((b.minutes, b.counts.ok, b.end_ms()), (60, 2, HOUR_MS));
+    assert_eq!(
+        serde_json::to_value(b).unwrap(),
+        serde_json::json!({"at": 0, "ok": 2})
+    );
+    let mut fine = Vec::new();
+    series::fold_fine(&mut fine, &summary(NOW, Status::Failed, None));
+    assert_eq!(serde_json::to_value(fine[0]).unwrap()["m"], 15);
+}

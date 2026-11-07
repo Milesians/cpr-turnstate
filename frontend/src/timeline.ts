@@ -99,6 +99,33 @@ export const severity: Record<CellState, number> = {
   degraded: 0, suspect: 1, unknown: 2, running: 3, ok: 4, empty: 5,
 }
 
+/** 探测受阻（凭据失效等）已确认（持续 30 分钟）；不是判定，但要排在前面、算作需要关注 */
+export function isBlocked(account: Pick<OverviewAccount, 'blocked'>): boolean {
+  return !!account.blocked?.confirmed_ms
+}
+
+/** 排序用的严重程度：确认受阻的排在疑似之后、未判定之前（降智和疑似仍在它前面） */
+export function rank(account: OverviewAccount): number {
+  const s = severity[accountState(account)]
+  return isBlocked(account) ? Math.min(s, 1.5) : s
+}
+
+/** 需要关注：降智、疑似，或探测受阻 */
+export function needsAttention(account: OverviewAccount): boolean {
+  const s = accountState(account)
+  return s === 'degraded' || s === 'suspect' || isBlocked(account)
+}
+
+/** 受阻原因的短说明 */
+export function blockedLabel(code: string): string {
+  switch (code) {
+    case 'credential_state': return '凭据失效'
+    case 'token_expired': return '令牌过期'
+    case 'no_credentials': return '缺少账号 ID'
+    default: return '探测受阻'
+  }
+}
+
 /** 判定正在变化：候选判定和当前不同，已连续确认了几次（满 3 次改变当前判定） */
 export function pendingChange(account: OverviewAccount): { to: Level, streak: number } | null {
   const h = account.health

@@ -27,7 +27,9 @@ const accounts = Array.from({length:40},(_,i)=>{
   const state = profile(i);
   const abnormal = state==='degraded';
   return {
-    id:'acct_'+i, name:'Account '+i, email:'test'+i+'@example.com', plan_type:plans[i%5], enabled:i!==17, credential_state:'ready', supported:i!==38, token_expires_ms:null, running:null,
+    id:'acct_'+i, name:'Account '+i, email:'test'+i+'@example.com', plan_type:plans[i%5], enabled:i!==17, credential_state:i===6?'expired':'ready',
+    blocked: i===6?{code:'credential_state',message:'凭据已失效（CPR 标记为 expired，令牌可能已被上游作废），需要重新登录或等 CPR 刷新',since_ms:now-2*H,confirmed_ms:now-90*60000}
+      : i===8?{code:'token_expired',message:'访问令牌已过期或即将过期。插件不刷新令牌（刷新令牌会轮换），等 CPR 自动刷新后再试',since_ms:now-12*60000,confirmed_ms:0} : null, supported:i!==38, token_expires_ms:null, running:null,
     __state: state,
     health: state==='empty'?{level:'unknown',model:'',candidate:null,streak:0,changed_ms:0,last_run_id:'',notification_pending:0,notification_error:null,notifications_dropped:0}
       : {level:state, model:'gpt-6-luna', candidate:i===0?'ok':i===1?'degraded':null, streak:i===0||i===1?2:0, changed_ms:now-(i+1)*3*H, last_run_id:'r'+i, notification_pending:i===0?1:0, notification_error:i===0?'TG 发送限流，稍后自动重试':null, notifications_dropped:0},
@@ -37,6 +39,7 @@ const accounts = Array.from({length:40},(_,i)=>{
     strip:[], rate:{judged:0,ok:0}, rate_24h:{judged:0,ok:0}, rate_7d:{judged:0,ok:0},
   };
 });
+const removed = new Set(); window.__removeAccount = id => removed.add(id);
 const bank = {commit:'a'.repeat(40),source:'github',models:['gpt-6-astra','gpt-6-luna'],checked_ms:now-2*H};
 const ranges = {24:900000, 168:2*H, 720:6*H};
 function rangeOf(hours){const slot=ranges[hours];const end=Math.floor((now+8*H)/slot)*slot-8*H+slot;return {hours,start_ms:end-hours*H,slot_ms:slot,slots:hours*H/slot}}
@@ -80,7 +83,7 @@ window.codexProxyPlugin = {version:2,get theme(){return document.documentElement
  }
  if(request.path==='api/overview'){
    const range=rangeOf(Number(q.get('hours')||24));
-   const out=accounts.map((a,index)=>{const strip=cellsFor(a,range,index);const sum=k=>strip.reduce((n,c)=>n+(c[k]??0),0);const judged=sum('ok')+sum('suspect')+sum('degraded');const {__state,...rest}=a;return {...rest,strip,rate:{judged,ok:sum('ok')}}});
+   const out=accounts.filter(a=>!removed.has(a.id)).map((a,index)=>{const strip=cellsFor(a,range,index);const sum=k=>strip.reduce((n,c)=>n+(c[k]??0),0);const judged=sum('ok')+sum('suspect')+sum('degraded');const {__state,...rest}=a;return {...rest,strip,rate:{judged,ok:sum('ok')}}});
    return reply({now_ms:now,range,config:{probe_enabled:true,min_interval_minutes:10,fingerprint_sync_hours:6,telegram_enabled:true,telegram_configured:true},bank,accounts:out});
  }
  const data = request.path === 'api/telegram/test' ? {sent:true}
@@ -310,7 +313,8 @@ try {
     await sleep(250);
     await evaluate("[...document.querySelectorAll('.filter-chip')].find(b=>b.textContent.includes('需要关注')).click()",context);
     await sleep(150);
-    assert(await evaluate("[...document.querySelectorAll('.monitor-row')].filter(r=>r.offsetParent).every(r=>['degraded','suspect'].includes(r.dataset.state))",context),'Attention filter shows only abnormal accounts');
+    assert(await evaluate("[...document.querySelectorAll('.monitor-row')].filter(r=>r.offsetParent).every(r=>['degraded','suspect'].includes(r.dataset.state)||r.dataset.blocked)",context),'Attention filter shows only abnormal or blocked accounts');
+    assert(await evaluate("[...document.querySelectorAll('.monitor-row')].some(r=>r.offsetParent&&r.dataset.account==='acct_6')",context),'A confirmed block needs attention');
     assert(await evaluate("document.querySelector('.selection-bar').textContent.includes('1 个不在当前筛选里')",context),'Hidden selected accounts must be called out');
     await shot('filtered');
     await evaluate("document.querySelector('[aria-label=\"查看 test0@example.com\"]').click()",context);
@@ -324,6 +328,32 @@ try {
     assert(await evaluate("document.querySelector('.filter-chip.active').textContent.includes('需要关注')&&document.querySelector('.selection-bar').textContent.includes('已选 2 个')",context),'Returning to the list keeps its filter and selection');
     await evaluate("[...document.querySelectorAll('.filter-chip')].find(b=>b.textContent.includes('全部')).click();[...document.querySelectorAll('.selection-bar button')].find(b=>b.textContent.trim()==='清空').click()",context);
     await sleep(200);
+    // 受阻不改判定，但排在疑似之后、未判定之前；有单独的筛选
+    const order=await evaluate("[...document.querySelectorAll('.monitor-row')].map(r=>({id:r.dataset.account,state:r.dataset.state,blocked:!!r.dataset.blocked}))",context);
+    const at=order.findIndex(r=>r.id==='acct_6');
+    assert(order[at].state==='ok'&&order[at].blocked,'Blocked account keeps its verdict');
+    assert(at>order.findLastIndex(r=>r.state==='suspect')&&at<order.findIndex(r=>r.state==='unknown'),'Confirmed block sorts between suspect and unknown: '+JSON.stringify(order.slice(0,16)));
+    assert(!order.find(r=>r.id==='acct_8').blocked,'An unconfirmed block does not change sorting');
+    assert(await evaluate("document.querySelector('[data-account=acct_6] .blocked-pill').textContent.includes('凭据失效')&&document.querySelector('[data-account=acct_8] .blocked-pill').textContent.includes('令牌过期')",context),'Blocked pills missing');
+    await evaluate("[...document.querySelectorAll('.filter-chip')].find(b=>b.textContent.includes('探测受阻')).click()",context);
+    await sleep(150);
+    assert.deepEqual(await evaluate("[...document.querySelectorAll('.monitor-row')].filter(r=>r.offsetParent).map(r=>r.dataset.account)",context),['acct_6'],'Blocked filter');
+    await shot('blocked');
+    await evaluate("document.querySelector('[aria-label=\"查看 test6@example.com\"]').click()",context);
+    await sleep(400);
+    assert(await evaluate("document.querySelector('.blocked-banner')?.textContent.includes('探测受阻')&&document.body.textContent.includes('这不是降智判定')",context),'Detail page shows the block');
+    await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='返回列表').click()",context);
+    await sleep(300);
+    await evaluate("[...document.querySelectorAll('.filter-chip')].find(b=>b.textContent.includes('全部')).click()",context);
+    await sleep(150);
+    // 选中的账号在 CPR 里被删掉：刷新后要从选中里去掉，否则批量配置整批被拒
+    await evaluate("document.querySelector('[data-account=acct_2] input[type=checkbox]').click();document.querySelector('[data-account=acct_4] input[type=checkbox]').click()",context);
+    await sleep(100);
+    await evaluate("window.__removeAccount('acct_2');[...document.querySelectorAll('button')].find(b=>b.getAttribute('aria-label')==='刷新').click()",context);
+    await sleep(300);
+    assert(await evaluate("document.querySelector('.selection-bar').textContent.includes('已选 1 个')",context),'Refreshing must drop accounts that no longer exist');
+    await evaluate("[...document.querySelectorAll('.selection-bar button')].find(b=>b.textContent.trim()==='清空').click()",context);
+    await sleep(150);
     console.log(`PASS ${width}x${height} method defaults, per-account controls and batch model configuration, no probe sent`);
 
 

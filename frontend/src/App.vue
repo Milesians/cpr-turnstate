@@ -3,7 +3,7 @@ import type { Models, Overview, OverviewAccount } from './api'
 import { ZButton, ZConfigProvider, ZTag } from '@codex-proxy/ui'
 import { zhHans } from '@codex-proxy/ui/locale'
 import { Activity, RefreshCw, Settings } from '@lucide/vue'
-import { computed, nextTick, onMounted, ref, shallowRef, useTemplateRef, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, shallowRef, watch } from 'vue'
 import { api } from './api'
 import AccountDetail from './components/AccountDetail.vue'
 import AccountList from './components/AccountList.vue'
@@ -12,6 +12,7 @@ import BatchProbeDialog from './components/BatchProbeDialog.vue'
 import ProbeDialog from './components/ProbeDialog.vue'
 import SettingsPage from './components/SettingsPage.vue'
 import { dateTime } from './format'
+import { needsAttention } from './timeline'
 
 type View = { name: 'list' } | { name: 'account', id: string, run?: string } | { name: 'settings' }
 
@@ -22,7 +23,6 @@ const loading = ref(false)
 const error = ref('')
 const notice = ref('')
 const hours = ref('24')
-const list = useTemplateRef('list')
 
 const probeAccount = shallowRef<OverviewAccount | null>(null)
 const probeOpen = ref(false)
@@ -31,7 +31,7 @@ const batchProbeOpen = ref(false)
 const batchConfigIds = ref<string[]>([])
 const batchConfigOpen = ref(false)
 
-const attention = computed(() => overview.value?.accounts.filter(a => a.health?.last_run_id && (a.health.level === 'degraded' || a.health.level === 'suspect')).length ?? 0)
+const attention = computed(() => overview.value?.accounts.filter(needsAttention).length ?? 0)
 
 let loadId = 0
 async function load() {
@@ -42,7 +42,6 @@ async function load() {
     const result = await api.overview(Number(hours.value))
     if (id === loadId) {
       overview.value = result
-      list.value?.prune()
     }
   }
   catch (e) {
@@ -130,7 +129,7 @@ onMounted(() => Promise.all([load(), loadModels()]))
         <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
         <p v-if="notice" class="banner banner-ok" role="status">{{ notice }}</p>
         <AccountList
-          ref="list" v-model:hours="hours" :overview="overview" :loading="loading"
+          v-model:hours="hours" :overview="overview" :loading="loading"
           @open="openAccount" @probe="probe" @batch-probe="batchProbe" @batch-config="batchConfig"
         />
       </div>

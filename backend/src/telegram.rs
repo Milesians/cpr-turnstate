@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::{
     config::Config,
-    health::Notification,
+    health::{NoticeKind, Notification},
     host, store,
     verdict::{Level, one_line},
 };
@@ -67,16 +67,8 @@ pub fn beijing_time(ms: i64) -> String {
     )
 }
 
-fn message(account: &AuthRuntimeAccount, event: &Notification) -> String {
-    let recovered = event.to == Level::Ok;
-    let mut lines = vec![format!(
-        "CPR 账号探测 | {}",
-        if recovered {
-            "测票恢复正常"
-        } else {
-            "测票异常确认"
-        }
-    )];
+fn account_lines(account: &AuthRuntimeAccount) -> Vec<String> {
+    let mut lines = Vec::new();
     let name = one_line(&account.name, 120);
     let email = account
         .email
@@ -89,6 +81,82 @@ fn message(account: &AuthRuntimeAccount, event: &Notification) -> String {
     if !email.is_empty() {
         lines.push(format!("邮箱：{email}"));
     }
+    lines
+}
+
+/// 时长：“2 小时 5 分钟”
+fn span(ms: i64) -> String {
+    let minutes = (ms / 60_000).max(1);
+    if minutes < 60 {
+        format!("{minutes} 分钟")
+    } else if minutes % 60 == 0 {
+        format!("{} 小时", minutes / 60)
+    } else {
+        format!("{} 小时 {} 分钟", minutes / 60, minutes % 60)
+    }
+}
+
+/// 账号凭据异常 / 恢复：不是判定，说明当前判定保持不变
+fn blocked_message(account: &AuthRuntimeAccount, event: &Notification) -> String {
+    let unblocked = event.kind == NoticeKind::Unblocked;
+    let mut lines = vec![format!(
+        "CPR 账号探测 | {}",
+        if unblocked {
+            "账号凭据已恢复"
+        } else {
+            "账号凭据异常"
+        }
+    )];
+    lines.extend(account_lines(account));
+    if let Some(b) = &event.blocked {
+        lines.push(format!(
+            "{}：{}",
+            if unblocked {
+                "原因已解除"
+            } else {
+                "原因"
+            },
+            one_line(&b.message, 200)
+        ));
+        lines.push(format!("开始：{}（北京时间）", beijing_time(b.since_ms)));
+        lines.push(format!(
+            "{}：{}",
+            if unblocked {
+                "受阻时长"
+            } else {
+                "已持续"
+            },
+            span(event.at_ms - b.since_ms)
+        ));
+    }
+    lines.push(format!("时间：{}（北京时间）", beijing_time(event.at_ms)));
+    lines.push(if unblocked {
+        "可以正常测票了；开着自动测票的下一轮维护起继续。".to_owned()
+    } else {
+        format!(
+            "测票发不出去，这不是降智判定；当前判定保持“{}”。原因解除后自动恢复并通知。",
+            label(event.to)
+        )
+    });
+    lines.push(format!("账号 ID：{}", one_line(&account.account_id, 100)));
+    lines.push(format!("事件 ID：{}", one_line(&event.id, 100)));
+    lines.join("\n")
+}
+
+fn message(account: &AuthRuntimeAccount, event: &Notification) -> String {
+    if event.kind != NoticeKind::Verdict {
+        return blocked_message(account, event);
+    }
+    let recovered = event.to == Level::Ok;
+    let mut lines = vec![format!(
+        "CPR 账号探测 | {}",
+        if recovered {
+            "测票恢复正常"
+        } else {
+            "测票异常确认"
+        }
+    )];
+    lines.extend(account_lines(account));
     lines.push(format!("判定：{} → {}", label(event.from), label(event.to)));
     lines.push(format!("模型：{}", one_line(&event.model, 100)));
     lines.push(format!("时间：{}（北京时间）", beijing_time(event.at_ms)));
