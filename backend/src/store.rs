@@ -1,8 +1,11 @@
 //! 探测设置、历史与单次记录，存在插件私有状态里
 //!
 //! - `settings/schedules`：每个账号每种方法的自动探测开关、模型与间隔
-//! - `history/<账号>/<方法>`：最近 30 天的探测摘要，按时间排列；超过 [`HISTORY_MAX_BYTES`]
-//!   时先去掉旧摘要的理由，再丢最旧的摘要（宿主单条私有状态最多 256 KiB）
+//! - `history/<账号>/<方法>`：当前判定、TG 待发队列，和这种方法 30 天的探测历史：最近
+//!   [`series::RAW_HOURS`] 小时（至少 [`series::RAW_KEEP`] 条）逐条保存，更早的按小时只记次数
+//!   （见 [`crate::series`]）。旧版只有逐条摘要，读的时候照样能用，下次写入时压缩。
+//!   超过 [`HISTORY_MAX_BYTES`] 时先去掉旧摘要的理由，再把最旧的逐条摘要并进按小时汇总
+//!   （宿主单条私有状态最多 256 KiB）
 //! - `runs/<记录 ID>`：单次探测的详情，每个账号每种方法只留最近 [`DETAIL_KEEP`] 条
 //!
 //! 私有状态只有按键读写，没有列表；摘要里记着哪些详情还在，清理时据此删除。
@@ -18,6 +21,7 @@ use crate::fingerprint::Challenge;
 use crate::health::{Health, HealthView, Notification};
 use crate::host;
 use crate::modeltrace::{Completion, ModelTraceResult};
+use crate::series::{self, Bucket, HOUR_MS};
 use crate::turnstate::TurnStateResult;
 use crate::verdict::{Level, UpstreamError, Verdict};
 
@@ -191,8 +195,12 @@ pub struct Summary {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct History {
+    /// 最近的逐条摘要，旧的在前
     #[serde(default)]
     runs: Vec<Summary>,
+    /// 更早的按小时汇总，旧的在前；旧版没有
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hours: Vec<Bucket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     health: Option<Health>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -205,6 +213,36 @@ struct History {
 }
 
 impl History {
+    /// 把逐条摘要压到最近 [`series::RAW_HOURS`] 小时（至少留最近 [`series::RAW_KEEP`] 条），
+    /// 更早的并进按小时汇总；丢掉 [`HISTORY_DAYS`] 天前的。返回被并掉、该删的详情 ID
+    fn compact(&mut self, now: i64) -> Vec<String> {
+        let cutoff = now - HISTORY_DAYS * DAY_MS;
+        let raw_since = now - series::RAW_HOURS * HOUR_MS;
+        let keep_from = self.runs.len().saturating_sub(series::RAW_KEEP);
+        let mut expired = Vec::new();
+        let mut kept = Vec::with_capacity(self.runs.len());
+        for (i, s) in std::mem::take(&mut self.runs).into_iter().enumerate() {
+            // 进行中的留给维护任务标成中断
+            if s.status == Status::Running
+                || s.started_ms >= raw_since
+                || (i >= keep_from && s.started_ms >= cutoff)
+            {
+                kept.push(s);
+                continue;
+            }
+            if s.detail {
+                expired.push(s.id.clone());
+            }
+            if s.started_ms >= cutoff {
+                series::fold(&mut self.hours, &s);
+            }
+        }
+        self.runs = kept;
+        let first_hour = series::floor(cutoff, HOUR_MS);
+        self.hours.retain(|b| b.at >= first_hour);
+        expired
+    }
+
     fn health_view(&self) -> HealthView {
         HealthView {
             health: self
@@ -314,7 +352,7 @@ fn json_len<T: Serialize>(value: &T) -> Result<usize, PluginFault> {
 }
 
 /// 把历史压到 [`HISTORY_MAX_BYTES`] 以内：先从最旧的开始去掉没有详情的摘要的理由，
-/// 还不够就从最旧的开始丢摘要（进行中的不丢）。返回被丢掉、该删的详情 ID
+/// 还不够就把最旧的逐条摘要并进按小时汇总（进行中的不动），次数不丢。返回被并掉、该删的详情 ID
 fn fit(history: &mut History) -> Result<Vec<String>, PluginFault> {
     let mut expired = Vec::new();
     let mut len = json_len(history)?;
@@ -340,8 +378,9 @@ fn fit(history: &mut History) -> Result<Vec<String>, PluginFault> {
                 continue;
             }
             let s = history.runs.remove(i);
-            // 摘要本身加上分隔它的逗号
+            // 摘要本身加上分隔它的逗号；并进汇总多出的字节由下面的实际编码核对
             len = len.saturating_sub(json_len(&s)? + 1);
+            series::fold(&mut history.hours, &s);
             if s.detail {
                 expired.push(s.id);
             }
@@ -534,18 +573,31 @@ pub async fn history(
     Ok(history_record(host, account_id, method).await?.0.runs)
 }
 
-/// Read raw history and the independently persisted current verdict together.
+/// 展示用的历史：最近的逐条摘要（旧的在前）、更早的按小时汇总，和测票的当前判定
+#[derive(Debug, Clone, Default)]
+pub struct HistoryView {
+    pub runs: Vec<Summary>,
+    pub buckets: Vec<Bucket>,
+    pub health: Option<HealthView>,
+}
+
+/// 读一个账号一种方法的历史，按现在压缩（只在内存里，不写回）
 ///
 /// # Errors
-/// Returns host state errors rather than fabricating a current verdict.
-pub async fn history_with_health(
+/// 回调失败时返回错误
+pub async fn history_view(
     host: &HostClient,
     account_id: &str,
     method: Method,
-) -> Result<(Vec<Summary>, Option<HealthView>), PluginFault> {
-    let (history, _) = history_record(host, account_id, method).await?;
+) -> Result<HistoryView, PluginFault> {
+    let (mut history, _) = history_record(host, account_id, method).await?;
     let health = (method == Method::Turnstate).then(|| history.health_view());
-    Ok((history.runs, health))
+    history.compact(crate::clock::now_ms());
+    Ok(HistoryView {
+        runs: history.runs,
+        buckets: history.hours,
+        health,
+    })
 }
 
 /// 账号测票的当前判定，和自动分组上次按哪个判定调整过
@@ -649,7 +701,7 @@ pub async fn save_with_notifications(
     Ok(version)
 }
 
-/// 写入一条摘要，丢掉 30 天前的摘要；返回该删的详情 ID
+/// 写入一条摘要并压缩历史；返回该删的详情 ID
 async fn upsert_summary(
     host: &HostClient,
     summary: Summary,
@@ -672,15 +724,7 @@ async fn upsert_summary(
             None => history.runs.push(summary.clone()),
         }
         history.runs.sort_by_key(|s| s.started_ms);
-        let cutoff = summary.started_ms.max(crate::clock::now_ms()) - HISTORY_DAYS * DAY_MS;
-        let mut expired = Vec::new();
-        history.runs.retain(|s| {
-            let keep = s.started_ms >= cutoff;
-            if !keep && s.detail {
-                expired.push(s.id.clone());
-            }
-            keep
-        });
+        let mut expired = history.compact(summary.started_ms.max(crate::clock::now_ms()));
         let with_detail = history.runs.iter().filter(|s| s.detail).count();
         let mut drop = with_detail.saturating_sub(DETAIL_KEEP);
         for s in &mut history.runs {

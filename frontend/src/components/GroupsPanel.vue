@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import type { CprGroup, GroupRule, GroupsView, Level } from '../api'
-import { ZButton, ZCheckbox, ZDialog, ZInput, ZSegmented, ZSelect, ZSwitch } from '@codex-proxy/ui'
+import type { CprGroup, GroupRule, GroupsView, Level, Overview } from '../api'
+import { ZButton, ZCheckbox, ZInput, ZSegmented, ZSelect, ZSwitch } from '@codex-proxy/ui'
 import { Plus, Trash2 } from '@lucide/vue'
-import { computed, ref, shallowRef, watch } from 'vue'
+import { computed, onMounted, ref, shallowRef } from 'vue'
 import { api } from '../api'
 import { dateTime, levelLabel } from '../format'
 
-const open = defineModel<boolean>({ default: false })
-
+const props = defineProps<{ overview?: Overview | null }>()
 const levels: Level[] = ['ok', 'suspect', 'degraded', 'unknown']
+/** 调整记录里显示邮箱或名称，不显示内部账号 ID */
+function accountLabel(id: string) {
+  const a = props.overview?.accounts.find(x => x.id === id)
+  return a ? a.email || a.name : id
+}
 const colors = [
   { label: '绿', value: '#22C55EFF' },
   { label: '红', value: '#EF4444FF' },
@@ -57,10 +61,16 @@ function setKind(rule: GroupRule, value: string) {
     delete rule.group_id
 }
 
+const snapshot = (on: boolean, list: GroupRule[]) => JSON.stringify({ on, list: list.map(r => ({ ...r, levels: [...r.levels].sort(), plans: [...(r.plans ?? [])].sort() })) })
+const saved = ref('')
+/** 和上次保存的不同才能点保存；没配过时建议的规则也算未保存 */
+const dirty = computed(() => snapshot(enabled.value, rules.value) !== saved.value)
+
 function fill(v: GroupsView) {
   view.value = v
   enabled.value = v.enabled
   rules.value = v.rules.length ? v.rules.map(r => ({ ...r, levels: [...r.levels] })) : suggested()
+  saved.value = snapshot(v.enabled, v.rules)
 }
 
 async function loadCprGroups() {
@@ -84,7 +94,7 @@ async function load() {
   catch (e) { error.value = (e as Error).message }
   finally { loading.value = false }
 }
-watch(open, value => { if (value) load() })
+onMounted(load)
 
 function toggle(rule: GroupRule, level: Level, on: boolean) {
   rule.levels = on ? [...new Set([...rule.levels, level])] : rule.levels.filter(l => l !== level)
@@ -118,9 +128,8 @@ async function save() {
 </script>
 
 <template>
-  <ZDialog v-model="open" title="自动分组" width="42rem" :close-on-click-modal="!saving" :close-on-press-escape="!saving" :before-close="() => !saving">
-    <div class="flex flex-col gap-4 text-cp-sm">
-      <p class="m-0 text-cp-text-secondary">
+  <div class="flex flex-col gap-4 text-cp-sm">
+    <p class="m-0 text-cp-text-secondary">
         按每个账号的<strong>测票当前判定</strong>（连续 3 次确认）自动调整 CPR 分组的成员，Client Key 绑定“测票正常”这类分组就只调度正常账号。
       </p>
       <ZSwitch v-model="enabled" label="开启自动分组" :disabled="saving || loading" />
@@ -134,7 +143,12 @@ async function save() {
             <Trash2 :size="14" aria-hidden="true" /> 删除
           </button>
         </div>
-        <div v-if="kind(rule) === 'owned'" class="flex flex-wrap items-center gap-2">
+        <div v-if="kind(rule) === 'owned' && rule.id" class="flex flex-wrap items-center gap-2">
+          <span class="inline-block size-3 shrink-0 rounded-full" :style="{ backgroundColor: rule.color }" aria-hidden="true" />
+          <span class="font-medium">{{ rule.name }}</span>
+          <span class="text-cp-xs text-cp-text-tertiary">名称和颜色在 CPR 的分组管理里改</span>
+        </div>
+        <div v-else-if="kind(rule) === 'owned'" class="flex flex-wrap items-center gap-2">
           <ZInput v-model="rule.name" placeholder="分组名" class="min-w-40 flex-1" :disabled="saving || !!rule.id" :aria-label="`第 ${i + 1} 个分组的名称`" />
           <span class="inline-block size-3 shrink-0 rounded-full" :style="{ backgroundColor: rule.color }" aria-hidden="true" />
           <ZSelect v-model="rule.color" :options="colors" class="w-24" :disabled="saving || !!rule.id" :aria-label="`第 ${i + 1} 个分组的颜色`" />
@@ -177,17 +191,16 @@ async function save() {
         <span class="text-cp-xs font-medium text-cp-text-secondary">最近的调整</span>
         <ul class="m-0 flex max-h-40 list-none flex-col gap-1 overflow-auto p-0 text-cp-xs text-cp-text-tertiary">
           <li v-for="(c, i) in view.status.changes" :key="i">
-            {{ dateTime(c.at_ms) }} · {{ c.account_id }} · {{ levelLabel[c.from] }} → {{ levelLabel[c.to] }}<template v-if="c.added.length"> · 加入 {{ c.added.join('、') }}</template><template v-if="c.removed.length"> · 移出 {{ c.removed.join('、') }}</template><template v-if="!c.added.length && !c.removed.length"> · 没有分组需要变</template>
+            {{ dateTime(c.at_ms) }} · <span class="text-cp-text-secondary" :title="c.account_id">{{ accountLabel(c.account_id) }}</span> · {{ levelLabel[c.from] }} → {{ levelLabel[c.to] }}<template v-if="c.added.length"> · 加入 {{ c.added.join('、') }}</template><template v-if="c.removed.length"> · 移出 {{ c.removed.join('、') }}</template><template v-if="!c.added.length && !c.removed.length"> · 没有分组需要变</template>
           </li>
         </ul>
       </div>
       <p v-if="view?.status.error" class="m-0 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-warning-on-container">{{ view.status.error }}</p>
       <p v-if="error" class="m-0 rounded-cp bg-cp-error-container px-3 py-2 text-cp-error-on-container" role="alert">{{ error }}</p>
       <p v-if="notice" class="m-0 text-cp-xs text-cp-success" role="status">{{ notice }}</p>
+    <div class="flex items-center gap-3">
+      <ZButton type="primary" :loading="saving" :disabled="loading || !dirty" @click="save">{{ dirty || saving ? '保存自动分组' : '已保存' }}</ZButton>
+      <span v-if="dirty && view" class="text-cp-xs text-cp-text-tertiary">有未保存的修改</span>
     </div>
-    <template #footer>
-      <ZButton :disabled="saving" @click="open = false">关闭</ZButton>
-      <ZButton type="primary" :loading="saving" :disabled="loading" @click="save">保存</ZButton>
-    </template>
-  </ZDialog>
+  </div>
 </template>

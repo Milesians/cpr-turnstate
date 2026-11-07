@@ -17,38 +17,81 @@ const dist = new URL('../frontend/dist/', import.meta.url)
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const fixture = `
 window.__requests = [];
-const method = () => ({schedule:{enabled:false,model:'gpt-6-astra',interval_minutes:60},last_attempt:null,latest:null,runs:[],slots:Array.from({length:96},(_,i)=>({start_ms:Date.now()-(96-i)*900000,end_ms:Date.now()-(95-i)*900000,level:null,count:0,running:0})),rate:{judged:0,ok:0},rate_24h:{judged:0,ok:0},rate_7d:{judged:0,ok:0}});
-const accounts = Array.from({length:40},(_,i)=>({id:'acct_'+i,name:'Account '+i,email:'test'+i+'@example.com',plan_type:'plus',enabled:true,credential_state:'ready',supported:true,token_expires_ms:null,running:null,methods:{turnstate:method(),modeltrace:method()}}));
-accounts[0].methods.turnstate.schedule.model='';accounts[0].methods.modeltrace.schedule.model='';
-accounts[0].methods.turnstate.health={level:'degraded',model:'gpt-6-astra',candidate:'ok',streak:2,changed_ms:Date.now(),last_run_id:'confirmed',notification_pending:1,notification_error:'TG 发送限流，稍后自动重试',notifications_dropped:0};
-const bank = {commit:'a'.repeat(40),source:'embedded',models:['gpt-6-astra'],checked_ms:0};
+const now = Date.now();
+const H = 3600000;
+const plans = ['plus','pro','team','plus','free'];
+const reasons = {ok:'第一次带回就被接受（KlN 的判据：首次即接受为正常）',suspect:'换过一次票后才被接受，疑似降智',degraded:'连续 3 次带回最新的票，每次都被换成新票（KlN 的判据：全部刷新即降智）',unknown:'上游没有下发票，无法判定'};
+const profile = i => i%7===0?'degraded':i%7===3?'suspect':i%11===5?'unknown':i%13===9?'empty':'ok';
+const summary = (id, ago, level, status='done') => ({id, model:'gpt-6-luna', trigger:'auto', started_ms:now-ago, finished_ms:now-ago+40000, status, ...(status==='done'?{level}:{}), reason:status==='failed'?'上游连接超时':reasons[level]??'', detail:ago<8*H});
+const accounts = Array.from({length:40},(_,i)=>{
+  const state = profile(i);
+  const abnormal = state==='degraded';
+  return {
+    id:'acct_'+i, name:'Account '+i, email:'test'+i+'@example.com', plan_type:plans[i%5], enabled:i!==17, credential_state:'ready', supported:i!==38, token_expires_ms:null, running:null,
+    __state: state,
+    health: state==='empty'?{level:'unknown',model:'',candidate:null,streak:0,changed_ms:0,last_run_id:'',notification_pending:0,notification_error:null,notifications_dropped:0}
+      : {level:state, model:'gpt-6-luna', candidate:i===0?'ok':i===1?'degraded':null, streak:i===0||i===1?2:0, changed_ms:now-(i+1)*3*H, last_run_id:'r'+i, notification_pending:i===0?1:0, notification_error:i===0?'TG 发送限流，稍后自动重试':null, notifications_dropped:0},
+    schedule:{turnstate:{enabled:state!=='empty',model:abnormal?'':'gpt-6-astra',interval_minutes:[10,30,60][i%3]},modeltrace:{enabled:false,model:abnormal?'':'gpt-6-astra',interval_minutes:60}},
+    last_attempt:null,
+    latest:{turnstate: state==='empty'?null:summary('r'+i,(i%9+1)*60000,state==='unknown'?'unknown':state, state==='unknown'?'failed':'done'), modeltrace:null},
+    strip:[], rate:{judged:0,ok:0}, rate_24h:{judged:0,ok:0}, rate_7d:{judged:0,ok:0},
+  };
+});
+const bank = {commit:'a'.repeat(40),source:'github',models:['gpt-6-astra','gpt-6-luna'],checked_ms:now-2*H};
+const ranges = {24:900000, 168:2*H, 720:6*H};
+function rangeOf(hours){const slot=ranges[hours];const end=Math.floor((now+8*H)/slot)*slot-8*H+slot;return {hours,start_ms:end-hours*H,slot_ms:slot,slots:hours*H/slot}}
+function cellsFor(a, range, index){
+  if(a.__state==='empty'||!a.supported) return [];
+  const cells=[];
+  for(let i=0;i<range.slots;i++){
+    if(i<range.slots/4||i%9===4) continue;
+    const late=i>range.slots-10;
+    const n=range.hours===24?1:range.hours===168?4:12;
+    const c={i};
+    if(a.__state==='ok') c.ok=n;
+    else if(a.__state==='degraded') { if(late) c.degraded=n; else c.ok=n; }
+    else if(a.__state==='suspect') { if(i%3===0) c.suspect=1, c.ok=n-1||0; else c.ok=n; }
+    else c.failed=n;
+    for(const k of Object.keys(c)) if(c[k]===0) delete c[k];
+    cells.push(c);
+  }
+  return cells;
+}
+function detailOf(a){
+  const runs=Array.from({length:24},(_,k)=>summary(a.id+'-'+k,(k*20+3)*60000,a.__state==='degraded'&&k<6?'degraded':a.__state==='suspect'&&k%4===0?'suspect':'ok', a.__state==='unknown'&&k%2?'failed':'done'));
+  const day=Math.floor((now+8*H)/(24*H))*24*H-8*H;
+  const daily=Array.from({length:30},(_,d)=>{const start_ms=day-(29-d)*24*H;if(d<6)return {start_ms};const o={start_ms,ok:a.__state==='degraded'&&d>26?20:120-(d%5)*7};if(a.__state==='degraded'&&d>26)o.degraded=100;if(a.__state==='suspect'&&d%4===0)o.suspect=9;if(d%6===0)o.failed=3;return o});
+  return {...a, methods:{
+    turnstate:{schedule:a.schedule.turnstate,last_attempt:null,health:a.health,runs,daily,raw_since:now-48*H},
+    modeltrace:{schedule:a.schedule.modeltrace,last_attempt:null,health:null,runs:[{...summary(a.id+'-mt',26*H,'ok'),model:'gpt-6.1-sol',trigger:'manual',reason:'gpt-6.1-sol 的概率 82%，最像它'}],daily:daily.map(d=>({start_ms:d.start_ms})),raw_since:null},
+  }};
+}
+const groups = {enabled:true,max_rules:8,admin_error:null,plans:['plus','pro','team','free'],
+  rules:[{id:'g1',name:'测票正常',color:'#22C55EFF',levels:['ok'],plans:[]},{id:'g2',group_id:'cpr-1',name:'PRO 异常',color:'#EF4444FF',levels:['suspect','degraded'],plans:['pro']}],
+  status:{synced_ms:now-1800000,rules:{g1:{group_id:'x1',group_name:'测票正常'},g2:{group_id:'cpr-1',group_name:'PRO 异常'}},changes:[{account_id:'acct_7',from:'ok',to:'degraded',at_ms:now-1200000,added:['PRO 异常'],removed:['测票正常']}]}};
 window.codexProxyPlugin = {version:2,get theme(){return document.documentElement.dataset.theme},request:async request=>{
  window.__requests.push(request);
- const hours=Number(new URLSearchParams(request.query).get('hours')||24);
- const count=hours===168?84:hours===720?120:96;
- for(const [index,account] of accounts.entries())for(const m of Object.values(account.methods)){
-   m.slots=Array.from({length:count},(_,i)=>{
-     const start=Date.now()-(count-i)*hours*3600000/count;
-     const active=index%5!==0&&i>count/3&&i%7!==0;
-     const level=index%5===1?'ok':index%5===2&&i>count-9?'degraded':index%5===3?'unknown':'ok';
-     return {start_ms:start,end_ms:start+hours*3600000/count,level:active?level:null,count:active?1:0,running:0}
-   });
-   m.rate={judged:index%5===0||index%5===3?0:30,ok:index%5===2?27:30};
- }
-
+ const q=new URLSearchParams(request.query);
+ const reply=data=>({status:200,contentType:'application/json',body:new TextEncoder().encode(JSON.stringify(data)).buffer});
  if(request.path==='api/schedules/batch'){
    const body=JSON.parse(request.body);
-   for(const id of body.account_ids){const account=accounts.find(a=>a.id===id);Object.assign(account.methods[body.method].schedule,Object.fromEntries(Object.entries(body).filter(([k])=>!['method','account_ids'].includes(k))));}
-   return {status:200,contentType:'application/json',body:new TextEncoder().encode(JSON.stringify({updated:body.account_ids.length})).buffer};
+   for(const id of body.account_ids){const account=accounts.find(a=>a.id===id);Object.assign(account.schedule[body.method],Object.fromEntries(Object.entries(body).filter(([k])=>!['method','account_ids'].includes(k))));}
+   return reply({updated:body.account_ids.length});
  }
- const data = request.path === 'api/overview' ? {now_ms:Date.now(),range_hours:hours,config:{probe_enabled:false,min_interval_minutes:30,fingerprint_sync_hours:6,telegram_enabled:true,telegram_configured:true},bank,accounts}
- : request.path === 'api/telegram/test' ? {sent:true}
- : request.path === 'api/account' ? {account:accounts.find(a=>a.id===new URLSearchParams(request.query).get('id')),config:{probe_enabled:false}}
- : request.path === 'api/runs' ? {runs:[{id:'r1',model:'gpt-6-luna',trigger:'auto',started_ms:Number(new URLSearchParams(request.query).get('from'))+1,finished_ms:0,status:'done',level:'degraded',reason:'模拟判定',detail:true}]}
- : request.path === 'api/models' ? {bank:[{id:'gpt-6-astra',display_name:'GPT',family:'GPT'}],cpr:['gpt-6-astra'],aliases:{}}
+ if(request.path==='api/overview'){
+   const range=rangeOf(Number(q.get('hours')||24));
+   const out=accounts.map((a,index)=>{const strip=cellsFor(a,range,index);const sum=k=>strip.reduce((n,c)=>n+(c[k]??0),0);const judged=sum('ok')+sum('suspect')+sum('degraded');const {__state,...rest}=a;return {...rest,strip,rate:{judged,ok:sum('ok')}}});
+   return reply({now_ms:now,range,config:{probe_enabled:true,min_interval_minutes:10,fingerprint_sync_hours:6,telegram_enabled:true,telegram_configured:true},bank,accounts:out});
+ }
+ const data = request.path === 'api/telegram/test' ? {sent:true}
+ : request.path === 'api/account' ? (()=>{const {__state,...a}=detailOf(accounts.find(a=>a.id===q.get('id')));return {account:{...a,methods:detailOf(accounts.find(x=>x.id===q.get('id'))).methods},config:{probe_enabled:true}}})()
+ : request.path === 'api/runs' ? (Number(q.get('from'))<now-48*H ? {runs:[],counts:{ok:9,degraded:3},complete:false} : {runs:[{id:'r1',model:'gpt-6-luna',trigger:'auto',started_ms:Number(q.get('from'))+1,finished_ms:0,status:'done',level:'degraded',reason:'模拟判定',detail:true}],counts:{degraded:1},complete:true})
+ : request.path === 'api/models' ? {bank:[{id:'gpt-6-astra',display_name:'GPT',family:'GPT'}],cpr:['gpt-6-astra','gpt-6-luna'],aliases:{}}
  : request.path === 'api/plan' ? {blockers:[],request:{headers:{'User-Agent':'CPR identity'},body:'request details '.repeat(200)}}
+ : request.path === 'api/groups' ? groups
+ : request.path === 'api/groups/cpr' ? {groups:[{id:'cpr-1',name:'PRO 异常',color:'#EF4444FF',enabled:true,plugin:false},{id:'cpr-2',name:'默认',color:'#3B82F6FF',enabled:true,plugin:false}]}
  : (()=>{throw Error('Unexpected request '+request.path)})();
- return {status:200,contentType:'application/json',body:new TextEncoder().encode(JSON.stringify(data)).buffer};
+ return reply(data);
 }};
 addEventListener('load',()=>new ResizeObserver(()=>parent.postMessage({height:Math.ceil(document.body.getBoundingClientRect().height)},'*')).observe(document.body),{once:true});
 `;
@@ -147,7 +190,7 @@ try {
     const assertTheme = async expected => {
       const style = await evaluate(`(()=>{
         const root=getComputedStyle(document.documentElement);
-        const summary=getComputedStyle(document.querySelector('.summary-item'));
+        const summary=getComputedStyle(document.querySelector('.filter-chip:not(.active)'));
         const list=getComputedStyle(document.querySelector('.monitor-list'));
         const input=getComputedStyle(document.querySelector('.monitor-search > span'));
         const button=getComputedStyle(document.querySelector('.monitor-actions button'));
@@ -171,6 +214,7 @@ try {
       assert.equal(style.appHeight,viewportHeight,`Viewport mismatch: ${protocol}/${expected}`);
       return style;
     };
+    const shot=async name=>{if(!process.env.SHOTS)return;const image=await send('Page.captureScreenshot',{format:'png'});await writeFile(join(process.env.SHOTS,`${name}-${protocol}-${mode}-${width}.png`),Buffer.from(image.data,'base64'))};
     const original=await assertTheme(mode);
     const other=mode==='light'?'dark':'light';
     await evaluate(`window.__setHostTheme('${other}')`,context);
@@ -217,21 +261,32 @@ try {
     await sleep(200);
     await evaluate("document.querySelector('.probe-cell:not([data-state=empty])').click()",context);
     await sleep(300);
+    await shot('popover');
     assert(await evaluate("window.__requests.some(r=>r.path==='api/runs')",context),'Opening a probed cell must load its records');
     assert(await evaluate("[...document.querySelectorAll('[role=dialog]')].some(e=>e.textContent.includes('模拟判定'))",context),'Loaded records missing from the cell popover');
     await evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}))",context);
     await sleep(200);
-    const screenshot=await send('Page.captureScreenshot',{format:'png'});
-    await writeFile(join(tmpdir(),`cpr-ui-${protocol}-${mode}-${width}.png`),Buffer.from(screenshot.data,'base64'));
+    await shot('list');
     for(const [label,range] of [['7 天',168],['30 天',720],['24 小时',24]]) {
       await evaluate(`([...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='${label}')).click()`,context);
       await sleep(300);
       assert(await evaluate(`window.__requests.some(r=>r.path==='api/overview'&&new URLSearchParams(r.query).get('hours')==='${range}')`,context),'Time range was not requested');
     }
     console.log(`PASS ${width}x${height} time filters request complete 24h / 7d / 30d ranges`);
-    await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='发送 TG 测试通知').click()",context);
+    await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='设置').click()",context);
+    await sleep(300);
+    assert(await evaluate("window.__requests.some(r=>r.path==='api/groups')&&document.body.textContent.includes('PRO 异常')",context),'Auto-grouping settings missing');
+    assert(await evaluate("document.body.textContent.includes('test7@example.com · 正常 → 降智')",context),'Group changes must name the account, not its internal ID');
+    assert(await evaluate("[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='已保存'&&b.disabled)",context),'Unchanged group settings must not offer saving');
+    await shot('settings-groups');
+    await evaluate("[...document.querySelectorAll('[role=radio]')].find(e=>e.textContent.trim()==='通知与运行').click()",context);
+    await sleep(200);
+    await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='发送测试通知').click()",context);
     await sleep(150);
     assert(await evaluate("window.__requests.some(r=>r.path==='api/telegram/test')&&document.body.textContent.includes('TG 测试通知已发送')",context),'Telegram test action missing');
+    await shot('settings-notify');
+    await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='返回列表').click()",context);
+    await sleep(300);
     await evaluate("document.querySelector('#app').scrollTop=0;document.querySelector('[data-account=acct_0] input[type=checkbox]').click();document.querySelector('[data-account=acct_1] input[type=checkbox]').click();",context);
     await sleep(100);
     await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='批量配置').click()",context);
@@ -245,10 +300,30 @@ try {
     const batch=await evaluate("JSON.parse(window.__requests.find(r=>r.path==='api/schedules/batch').body)",context);
     assert.deepEqual(batch,{account_ids:['acct_0','acct_1'],method:'turnstate',enabled:true,model:'gpt-6-luna'});
     assert(!await evaluate("window.__requests.some(r=>r.path==='api/probe')",context),'Configuration must never start a probe');
-    await evaluate("document.querySelector('[aria-label=\"配置 test0@example.com\"]').click()",context);
+    await sleep(200);
+    await evaluate("[...document.querySelectorAll('.selection-bar button')].find(b=>b.textContent.trim()==='批量探测').click()",context);
     await sleep(300);
-    assert(await evaluate("document.body.textContent.includes('自动探测')&&document.querySelectorAll('[role=combobox]').length>=2",context),'Per-account configuration missing');
-    assert(await evaluate("document.body.textContent.includes('当前判定')&&document.body.textContent.includes('正常 2/3')&&document.body.textContent.includes('TG 待发送 1 条')",context),'Health streak or notification status missing');
+    assert.equal(await evaluate("document.querySelectorAll('[role=dialog] .batch-item').length",context),2,'Batch probe lists the selected accounts');
+    assert(!await evaluate("window.__requests.some(r=>r.path==='api/probe')",context),'Opening batch probe must not start probes');
+    await shot('batch-probe');
+    await evaluate("[...document.querySelectorAll('[role=dialog] button')].find(b=>b.textContent.trim()==='关闭').click()",context);
+    await sleep(250);
+    await evaluate("[...document.querySelectorAll('.filter-chip')].find(b=>b.textContent.includes('需要关注')).click()",context);
+    await sleep(150);
+    assert(await evaluate("[...document.querySelectorAll('.monitor-row')].filter(r=>r.offsetParent).every(r=>['degraded','suspect'].includes(r.dataset.state))",context),'Attention filter shows only abnormal accounts');
+    assert(await evaluate("document.querySelector('.selection-bar').textContent.includes('1 个不在当前筛选里')",context),'Hidden selected accounts must be called out');
+    await shot('filtered');
+    await evaluate("document.querySelector('[aria-label=\"查看 test0@example.com\"]').click()",context);
+    await sleep(400);
+    assert(await evaluate("document.body.textContent.includes('自动探测')&&document.querySelectorAll('[role=combobox]').length>=1",context),'Per-account configuration missing');
+    assert(await evaluate("document.body.textContent.includes('测票当前判定')&&document.body.textContent.includes('2 / 3 次正常')&&document.body.textContent.includes('TG 待发送 1 条')",context),'Health streak or notification status missing');
+    assert(await evaluate("document.querySelectorAll('.trend-chart rect').length>=30",context),'Trend chart missing');
+    await shot('detail');
+    await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='返回列表').click()",context);
+    await sleep(300);
+    assert(await evaluate("document.querySelector('.filter-chip.active').textContent.includes('需要关注')&&document.querySelector('.selection-bar').textContent.includes('已选 2 个')",context),'Returning to the list keeps its filter and selection');
+    await evaluate("[...document.querySelectorAll('.filter-chip')].find(b=>b.textContent.includes('全部')).click();[...document.querySelectorAll('.selection-bar button')].find(b=>b.textContent.trim()==='清空').click()",context);
+    await sleep(200);
     console.log(`PASS ${width}x${height} method defaults, per-account controls and batch model configuration, no probe sent`);
 
 

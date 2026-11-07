@@ -62,31 +62,33 @@ export interface Summary {
   detail: boolean
 }
 
-/** 时间条的一格只带判定和次数；记录在打开弹层时用 `api.runs` 再取 */
-export interface Slot {
+/** 一段时间里各结果的次数；为 0 的项不返回 */
+export interface Counts {
+  ok?: number
+  suspect?: number
+  degraded?: number
+  /** 探测完成但没有判定 */
+  unknown?: number
+  failed?: number
+  running?: number
+}
+
+/** 时间条的范围：从 start_ms 起 slots 格，每格 slot_ms（按北京时间对齐） */
+export interface Range {
+  hours: number
   start_ms: number
-  end_ms: number
-  level: Level | null
-  /** 这段时间发起的探测次数 */
-  count: number
-  /** 其中还在进行的次数 */
-  running: number
+  slot_ms: number
+  slots: number
+}
+
+/** 时间条里有探测的一格：第 i 格和它的次数；没列出的格子没有探测 */
+export interface Cell extends Counts {
+  i: number
 }
 
 export interface Rate {
   judged: number
   ok: number
-}
-
-export interface MethodView {
-  schedule: Schedule
-  last_attempt: LastAttempt | null
-  latest: Summary | null
-  health?: Health | null
-  slots: Slot[]
-  rate: Rate
-  rate_24h: Rate
-  rate_7d: Rate
 }
 
 export interface Health {
@@ -113,8 +115,39 @@ export interface Account {
   running: string | null
 }
 
+/** 列表的一行：测票的当前判定、时间条与正常率，两种方法最近一次的结果 */
 export interface OverviewAccount extends Account {
-  methods: Record<Method, MethodView>
+  health: Health | null
+  schedule: Record<Method, Schedule>
+  last_attempt: LastAttempt | null
+  latest: Record<Method, Summary | null>
+  strip: Cell[]
+  rate: Rate
+  rate_24h: Rate
+  rate_7d: Rate
+}
+
+export interface Day extends Counts {
+  start_ms: number
+}
+
+export interface MethodDetail {
+  schedule: Schedule
+  last_attempt: LastAttempt | null
+  health: Health | null
+  /** 最近的逐条记录，新的在前 */
+  runs: Summary[]
+  /** 30 天每天的次数，旧的在前 */
+  daily: Day[]
+  /** 更早的只剩次数时，逐条记录从这个时间开始 */
+  raw_since: number | null
+}
+
+/** 一段时间里的记录；complete 为假表示有一部分只剩次数 */
+export interface RunsPage {
+  runs: Summary[]
+  counts: Counts
+  complete: boolean
 }
 
 export interface BankInfo {
@@ -136,16 +169,14 @@ export interface Config {
 
 export interface Overview {
   now_ms: number
-  range_hours: number
+  range: Range
   config: Config
   bank: BankInfo
   accounts: OverviewAccount[]
 }
 
 export interface AccountDetail {
-  account: Account & {
-    methods: Record<Method, { schedule: Schedule, last_attempt: LastAttempt | null, runs: Summary[], health?: Health | null }>
-  }
+  account: Account & { methods: Record<Method, MethodDetail> }
   config: { probe_enabled: boolean }
 }
 
@@ -303,7 +334,7 @@ export const api = {
   account: (id: string) => call<AccountDetail>('GET', 'api/account', { id }),
   run: (id: string, account: string) => call<{ run: Run }>('GET', 'api/run', { id, account }),
   /** 一段时间里的记录，新的在前 */
-  runs: (account: string, method: Method, from: number, to: number) => call<{ runs: Summary[] }>('GET', 'api/runs', { account, method, from: String(from), to: String(to) }),
+  runs: (account: string, method: Method, from: number, to: number) => call<RunsPage>('GET', 'api/runs', { account, method, from: String(from), to: String(to) }),
   models: () => call<Models>('GET', 'api/models'),
   plan: (account_id: string, method: Method, model: string) => call<Plan>('POST', 'api/plan', undefined, { account_id, method, model }),
   probe: (account_id: string, method: Method, model: string) => call<{ run: Run }>('POST', 'api/probe', undefined, { account_id, method, model }),

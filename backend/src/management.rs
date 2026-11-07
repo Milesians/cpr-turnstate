@@ -20,13 +20,11 @@ use crate::App;
 use crate::clock::now_ms;
 use crate::host;
 use crate::runner::{Blocker, Trigger, supported};
-use crate::scheduler::LastAttempt;
+use crate::series::{self, Counts, HOUR_MS, Range};
 use crate::store::{self, Method, MethodSchedule, Run, Status, Summary};
-use crate::verdict::Level;
 
 const JSON: &str = "application/json";
 const MAX_BODY: usize = 64 * 1024;
-const HOUR_MS: i64 = 3_600_000;
 
 pub fn registration() -> ManagementRegistration {
     let route = |method: &str, path: &str| ManagementRoute {
@@ -142,10 +140,9 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
                 .get("hours")
                 .map_or(Ok(24), |v| v.parse::<i64>())
                 .map_err(|_| ApiError::invalid("时间范围无效"))?;
-            if ![24, 168, 720].contains(&hours) {
-                return Err(ApiError::invalid("时间范围只支持 24 小时、7 天或 30 天"));
-            }
-            overview(app, host, hours).await
+            let range = Range::new(hours, now_ms())
+                .ok_or_else(|| ApiError::invalid("时间范围只支持 24 小时、7 天或 30 天"))?;
+            overview(app, host, range).await
         }
         ("GET", "api/account") => account_detail(app, host, required(&query, "id")?).await,
         ("GET", "api/run") => {
@@ -375,99 +372,30 @@ impl AccountView {
     }
 }
 
-/// 时间条的一格只带判定和次数；这段时间的记录由 `api/runs` 在打开弹层时再取，
-/// 否则 7 天、30 天的总览会超过宿主管理响应 1 MiB 的上限
-#[derive(Serialize)]
-struct Slot {
-    start_ms: i64,
-    end_ms: i64,
-    /// 最严重的判定；探测了但都没判定（失败）是 unknown，没探测为空
-    level: Option<Level>,
-    /// 这段时间发起的探测次数
-    count: u32,
-    /// 其中还在进行的次数
-    running: u32,
-}
-
 #[derive(Serialize, Default)]
 struct Rate {
     judged: u32,
     ok: u32,
 }
 
-#[derive(Serialize)]
-struct MethodView {
-    schedule: MethodSchedule,
-    last_attempt: Option<LastAttempt>,
-    latest: Option<Summary>,
-    health: Option<crate::health::HealthView>,
-    slots: Vec<Slot>,
-    rate: Rate,
-    rate_24h: Rate,
-    rate_7d: Rate,
-}
-
-fn judged_level(s: &Summary) -> Option<Level> {
-    match s.status {
-        Status::Running => None,
-        Status::Failed => Some(Level::Unknown),
-        Status::Done => Some(s.level.unwrap_or(Level::Unknown)),
-    }
-}
-
-fn rate(history: &[Summary], since: i64) -> Rate {
-    let mut r = Rate::default();
-    for s in history.iter().filter(|s| s.started_ms >= since) {
-        match judged_level(s) {
-            Some(Level::Unknown) | None => {}
-            Some(level) => {
-                r.judged += 1;
-                if level == Level::Ok {
-                    r.ok += 1;
-                }
-            }
+impl From<Counts> for Rate {
+    fn from(c: Counts) -> Self {
+        Self {
+            judged: c.judged(),
+            ok: c.ok,
         }
     }
-    r
 }
 
-fn slots(history: &[Summary], now: i64, hours: i64) -> Vec<Slot> {
-    // 固定基础精度；前端按可用宽度合并相邻格，保留完整的时间范围和记录。
-    let count = match hours {
-        168 => 84,
-        720 => 120,
-        _ => 96,
-    };
-    let end = now + 1;
-    let first = end - hours * HOUR_MS;
-    let step = hours * HOUR_MS / count;
-    let mut out: Vec<Slot> = (0..count)
-        .map(|i| Slot {
-            start_ms: first + i * step,
-            end_ms: first + (i + 1) * step,
-            level: None,
-            count: 0,
-            running: 0,
-        })
-        .collect();
-    for s in history {
-        if s.started_ms < first || s.started_ms >= end {
-            continue;
-        }
-        let index = usize::try_from((s.started_ms - first) / step).unwrap_or_default();
-        let slot = &mut out[index];
-        if let Some(level) = judged_level(s) {
-            slot.level = Some(slot.level.map_or(level, |cur| cur.max(level)));
-        }
-        slot.count += 1;
-        if s.status == Status::Running {
-            slot.running += 1;
-        }
-    }
-    out
+fn latest(runs: &[Summary]) -> Option<&Summary> {
+    runs.iter().rev().find(|s| s.status != Status::Running)
 }
 
-async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, ApiError> {
+/// 列表：每个账号一行，带测票的当前判定、时间条和正常率，以及两种方法最近一次的结果。
+///
+/// 时间条只列出有探测的格子和各结果的次数（格子位置由 `range` 算），记录在打开格子时用
+/// `api/runs` 再取；这样账号再多、范围再长，正文也远在宿主管理响应 1 MiB 的上限以内
+async fn overview(app: &App, host: &HostClient, range: Range) -> Result<Value, ApiError> {
     let accounts = host::openai_accounts(host).await?;
     let (schedules, _) = store::schedules(host).await?;
     let now = now_ms();
@@ -478,44 +406,34 @@ async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, Api
             .get(&a.account_id)
             .cloned()
             .unwrap_or_default();
-        let mut methods = serde_json::Map::new();
-        for method in Method::ALL {
-            let (history, health) = if supported(a) {
-                store::history_with_health(host, &a.account_id, method).await?
-            } else {
-                (Vec::new(), None)
-            };
-            let view = MethodView {
-                schedule: schedule.get(method).clone(),
-                last_attempt: app.scheduler.last(&a.account_id, method),
-                latest: history
-                    .iter()
-                    .rev()
-                    .find(|s| s.status != Status::Running)
-                    .cloned(),
-                health,
-                // 列表只显示测票的时间条（ModelTrace 的记录在账号详情里）
-                slots: if method.schedulable() {
-                    slots(&history, now, hours)
-                } else {
-                    Vec::new()
-                },
-                rate: rate(&history, now - hours * HOUR_MS),
-                rate_24h: rate(&history, now - 24 * HOUR_MS),
-                rate_7d: rate(&history, now - 7 * 24 * HOUR_MS),
-            };
-            methods.insert(
-                method.as_str().into(),
-                serde_json::to_value(view).unwrap_or(Value::Null),
-            );
-        }
+        let (turnstate, modeltrace) = if supported(a) {
+            (
+                store::history_view(host, &a.account_id, Method::Turnstate).await?,
+                store::history_view(host, &a.account_id, Method::Modeltrace).await?,
+            )
+        } else {
+            Default::default()
+        };
+        let t = &turnstate;
+        let rate_since =
+            |from: i64| Rate::from(series::between(from, i64::MAX, &t.runs, &t.buckets));
         let mut view = serde_json::to_value(AccountView::new(app, a)).unwrap_or(Value::Null);
-        view["methods"] = Value::Object(methods);
+        view["health"] = json!(turnstate.health);
+        view["schedule"] = json!(schedule);
+        view["last_attempt"] = json!(app.scheduler.last(&a.account_id, Method::Turnstate));
+        view["latest"] = json!({
+            "turnstate": latest(&turnstate.runs),
+            "modeltrace": latest(&modeltrace.runs),
+        });
+        view["strip"] = json!(series::strip(&range, &t.runs, &t.buckets));
+        view["rate"] = json!(rate_since(range.start_ms));
+        view["rate_24h"] = json!(rate_since(now - 24 * HOUR_MS));
+        view["rate_7d"] = json!(rate_since(now - 7 * 24 * HOUR_MS));
         views.push(view);
     }
     Ok(json!({
         "now_ms": now,
-        "range_hours": hours,
+        "range": range,
         "config": {
             "probe_enabled": app.runner.config.probe_enabled,
             "min_interval_minutes": app.runner.config.min_interval_minutes,
@@ -528,7 +446,8 @@ async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, Api
     }))
 }
 
-/// 时间条一格（或合并后的几格）里的记录，新的在前
+/// 时间条一格（或合并后的几格）里的记录，新的在前。更早的只剩按小时汇总的次数，
+/// `complete` 为假表示这段时间有一部分只有次数、没有逐条记录
 async fn runs_between(
     host: &HostClient,
     account_id: &str,
@@ -536,16 +455,25 @@ async fn runs_between(
     from: i64,
     to: i64,
 ) -> Result<Value, ApiError> {
+    if from >= to {
+        return Err(ApiError::invalid("时间范围无效"));
+    }
     supported_account(host, account_id).await?;
-    let (history, _) = store::history_with_health(host, account_id, method).await?;
-    let mut runs: Vec<Summary> = history
-        .into_iter()
+    let view = store::history_view(host, account_id, method).await?;
+    let mut runs: Vec<&Summary> = view
+        .runs
+        .iter()
         .filter(|s| s.started_ms >= from && s.started_ms < to)
         .collect();
     runs.reverse();
-    Ok(json!({"runs": runs}))
+    Ok(json!({
+        "runs": runs,
+        "counts": series::between(from, to, &view.runs, &view.buckets),
+        "complete": !series::has_buckets(from, to, &view.buckets),
+    }))
 }
 
+/// 账号详情：每种方法的设置、当前判定、最近的逐条记录（新的在前）和 30 天每天的次数
 async fn account_detail(app: &App, host: &HostClient, id: &str) -> Result<Value, ApiError> {
     let account = host::account(host, id).await?;
     if account.provider_id != "openai" {
@@ -553,17 +481,25 @@ async fn account_detail(app: &App, host: &HostClient, id: &str) -> Result<Value,
     }
     let (schedules, _) = store::schedules(host).await?;
     let schedule = schedules.accounts.get(id).cloned().unwrap_or_default();
+    let now = now_ms();
     let mut methods = serde_json::Map::new();
     for method in Method::ALL {
-        let (mut history, health) = store::history_with_health(host, id, method).await?;
-        history.reverse();
+        let view = store::history_view(host, id, method).await?;
+        let daily = series::daily(store::HISTORY_DAYS, now, &view.runs, &view.buckets);
+        // 更早的只剩次数：页面据此说明逐条记录从什么时候开始
+        let raw_since = (!view.buckets.is_empty())
+            .then(|| view.runs.first().map(|s| s.started_ms))
+            .flatten();
+        let runs: Vec<&Summary> = view.runs.iter().rev().collect();
         methods.insert(
             method.as_str().into(),
             json!({
                 "schedule": schedule.get(method),
                 "last_attempt": app.scheduler.last(id, method),
-                "runs": history,
-                "health": health,
+                "health": view.health,
+                "runs": runs,
+                "daily": daily,
+                "raw_since": raw_since,
             }),
         );
     }
