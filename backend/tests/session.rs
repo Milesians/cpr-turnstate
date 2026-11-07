@@ -1151,3 +1151,82 @@ async fn modeltrace_needs_a_configured_client_key_and_creates_nothing() {
         host.calls
     );
 }
+
+/// 每 10 分钟自动测票时，30 天的摘要会超过宿主单条 256 KiB 的上限（生产里的 502）
+fn crowded_history(host: &mut FakeHost, count: usize, reason: &str) {
+    let now = cpr_account_probe::clock::now_ms();
+    let runs: Vec<Value> = (0..count)
+        .map(|i| {
+            let started = now - 600_000 * (count - i) as i64;
+            json!({
+                "id": format!("old-{i}"), "model": "gpt-6-astra", "trigger": "auto",
+                "started_ms": started, "finished_ms": started + 60_000,
+                "status": "done", "level": "degraded", "reason": reason,
+                // 最旧的一条还留着详情，被丢掉时要一并删掉
+                "detail": i == 0,
+            })
+        })
+        .collect();
+    host.state.insert(
+        ("runs".into(), "old-0".into()),
+        (
+            json!({
+                "id": "old-0", "account_id": "acct_a", "method": "turnstate",
+                "model": "gpt-6-astra", "trigger": "auto",
+                "started_ms": now - 600_000 * count as i64, "status": "failed",
+            }),
+            1,
+        ),
+    );
+    host.state.insert(
+        ("history".into(), "acct_a/turnstate".into()),
+        (json!({"runs": runs}), 1),
+    );
+}
+
+fn history_bytes(host: &FakeHost) -> usize {
+    serde_json::to_vec(host.get("history", "acct_a/turnstate").unwrap())
+        .unwrap()
+        .len()
+}
+
+#[tokio::test]
+async fn full_history_drops_old_reasons_instead_of_failing() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    let reason = "连续 3 次带回最新的票，每次都被换成新票（KlN 的判据：全部刷新即降智）";
+    crowded_history(&mut host, 950, reason);
+    assert!(history_bytes(&host) > cpr_account_probe::store::HISTORY_MAX_BYTES);
+    let mut peer = Peer::start(ENABLED()).await;
+    ticket_probe(&mut peer, &mut host, "ok").await;
+    assert!(history_bytes(&host) <= cpr_account_probe::store::HISTORY_MAX_BYTES);
+    let runs = host.get("history", "acct_a/turnstate").unwrap()["runs"]
+        .as_array()
+        .unwrap()
+        .clone();
+    // 只去掉了旧理由，一条摘要都没丢
+    assert_eq!(runs.len(), 951);
+    // 留着详情的那条不动，没有详情的从最旧的开始去掉理由
+    assert_eq!(runs[0]["reason"], reason);
+    assert_eq!(runs[1]["reason"], "");
+    assert_eq!(runs[949]["reason"], reason);
+    assert_eq!(runs[950]["level"], "ok");
+}
+
+#[tokio::test]
+async fn full_history_drops_oldest_summaries_and_their_details() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    crowded_history(&mut host, 2000, "");
+    let mut peer = Peer::start(ENABLED()).await;
+    ticket_probe(&mut peer, &mut host, "ok").await;
+    assert!(history_bytes(&host) <= cpr_account_probe::store::HISTORY_MAX_BYTES);
+    let runs = host.get("history", "acct_a/turnstate").unwrap()["runs"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(runs.len() < 2000);
+    assert_ne!(runs[0]["id"], "old-0");
+    assert_eq!(runs.last().unwrap()["level"], "ok");
+    assert!(host.get("runs", "old-0").is_none());
+    // 之后的测票照常写入
+    ticket_probe(&mut peer, &mut host, "ok").await;
+}

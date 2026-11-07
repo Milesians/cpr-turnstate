@@ -1,7 +1,8 @@
 //! 探测设置、历史与单次记录，存在插件私有状态里
 //!
 //! - `settings/schedules`：每个账号每种方法的自动探测开关、模型与间隔
-//! - `history/<账号>/<方法>`：最近 30 天的探测摘要，按时间排列
+//! - `history/<账号>/<方法>`：最近 30 天的探测摘要，按时间排列；超过 [`HISTORY_MAX_BYTES`]
+//!   时先去掉旧摘要的理由，再丢最旧的摘要（宿主单条私有状态最多 256 KiB）
 //! - `runs/<记录 ID>`：单次探测的详情，每个账号每种方法只留最近 [`DETAIL_KEEP`] 条
 //!
 //! 私有状态只有按键读写，没有列表；摘要里记着哪些详情还在，清理时据此删除。
@@ -31,6 +32,8 @@ pub const HISTORY_DAYS: i64 = 30;
 /// 每个账号每种方法保留详情的条数
 pub const DETAIL_KEEP: usize = 50;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// 一个账号一种方法的历史记录编码后最多多少字节。宿主单条上限 256 KiB，留出余量
+pub const HISTORY_MAX_BYTES: usize = 240 * 1024;
 
 /// 探测方法
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -304,6 +307,78 @@ fn history_key(account_id: &str, method: Method) -> String {
     format!("{account_id}/{}", method.as_str())
 }
 
+fn json_len<T: Serialize>(value: &T) -> Result<usize, PluginFault> {
+    serde_json::to_vec(value)
+        .map(|v| v.len())
+        .map_err(|_| PluginFault::new(ErrorCode::Fault, "记录编码失败"))
+}
+
+/// 把历史压到 [`HISTORY_MAX_BYTES`] 以内：先从最旧的开始去掉没有详情的摘要的理由，
+/// 还不够就从最旧的开始丢摘要（进行中的不丢）。返回被丢掉、该删的详情 ID
+fn fit(history: &mut History) -> Result<Vec<String>, PluginFault> {
+    let mut expired = Vec::new();
+    let mut len = json_len(history)?;
+    if len <= HISTORY_MAX_BYTES {
+        return Ok(expired);
+    }
+    for s in &mut history.runs {
+        if len <= HISTORY_MAX_BYTES {
+            break;
+        }
+        if !s.detail && !s.reason.is_empty() {
+            // 编码后的字符串去掉两侧引号就是省下的字节
+            len -= json_len(&s.reason)? - 2;
+            s.reason.clear();
+        }
+    }
+    while len > HISTORY_MAX_BYTES {
+        let mut dropped = false;
+        let mut i = 0;
+        while i < history.runs.len() && len > HISTORY_MAX_BYTES {
+            if history.runs[i].status == Status::Running {
+                i += 1;
+                continue;
+            }
+            let s = history.runs.remove(i);
+            // 摘要本身加上分隔它的逗号
+            len = len.saturating_sub(json_len(&s)? + 1);
+            if s.detail {
+                expired.push(s.id);
+            }
+            dropped = true;
+        }
+        // 估算可能有出入，按实际编码再核一次
+        len = json_len(history)?;
+        if !dropped {
+            break;
+        }
+    }
+    Ok(expired)
+}
+
+/// 写入历史前压到上限以内；被丢掉的摘要的详情一并删除
+async fn put_history(
+    host: &HostClient,
+    key: &str,
+    history: &mut History,
+    version: Option<u64>,
+    expired: &mut Vec<String>,
+) -> Result<(), PluginFault> {
+    expired.extend(fit(history)?);
+    host::state_put(host, HISTORY, key, encode(&*history)?, version)
+        .await
+        .map(|_| ())
+}
+
+async fn delete_runs(host: &HostClient, ids: Vec<String>) -> Result<(), PluginFault> {
+    for id in ids {
+        if let Some((_, v)) = run(host, &id).await? {
+            let _ = host::state_delete(host, RUNS, &id, v).await;
+        }
+    }
+    Ok(())
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<Value, PluginFault> {
     serde_json::to_value(value).map_err(|_| PluginFault::new(ErrorCode::Fault, "记录编码失败"))
 }
@@ -501,8 +576,9 @@ pub async fn set_grouped_level(
             return Ok(());
         }
         history.grouped_level = Some(level);
-        match host::state_put(host, HISTORY, &key, encode(&history)?, version).await {
-            Ok(_) => return Ok(()),
+        let mut expired = Vec::new();
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return delete_runs(host, expired).await,
             Err(error) if error.code == ErrorCode::Conflict => {}
             Err(error) => return Err(error),
         }
@@ -569,11 +645,7 @@ pub async fn save_with_notifications(
         notifications,
     )
     .await?;
-    for id in expired {
-        if let Some((_, v)) = self::run(host, &id).await? {
-            let _ = host::state_delete(host, RUNS, &id, v).await;
-        }
-    }
+    delete_runs(host, expired).await?;
     Ok(version)
 }
 
@@ -621,8 +693,8 @@ async fn upsert_summary(
                 drop -= 1;
             }
         }
-        match host::state_put(host, HISTORY, &key, encode(&history)?, version).await {
-            Ok(_) => return Ok(expired),
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return Ok(expired),
             Err(error) if error.code == ErrorCode::Conflict => {}
             Err(error) => return Err(error),
         }
@@ -656,16 +728,13 @@ pub(crate) async fn claim_notification(
             history.notifications.clear();
             None
         };
-        match host::state_put(
-            host,
-            HISTORY,
-            &history_key(account_id, Method::Turnstate),
-            encode(&history)?,
-            version,
-        )
-        .await
-        {
-            Ok(_) => return Ok(claimed),
+        let mut expired = Vec::new();
+        let key = history_key(account_id, Method::Turnstate);
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => {
+                delete_runs(host, expired).await?;
+                return Ok(claimed);
+            }
             Err(e) if e.code == ErrorCode::Conflict => {}
             Err(e) => return Err(e),
         }
@@ -698,16 +767,10 @@ pub(crate) async fn finish_notification(
         } else {
             history.notifications.remove(index);
         }
-        match host::state_put(
-            host,
-            HISTORY,
-            &history_key(account_id, Method::Turnstate),
-            encode(&history)?,
-            version,
-        )
-        .await
-        {
-            Ok(_) => return Ok(()),
+        let mut expired = Vec::new();
+        let key = history_key(account_id, Method::Turnstate);
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return delete_runs(host, expired).await,
             Err(e) if e.code == ErrorCode::Conflict => {}
             Err(e) => return Err(e),
         }

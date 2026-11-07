@@ -56,7 +56,7 @@ onBeforeUnmount(() => observer?.disconnect())
                 <span class="text-cp-text">{{ run.model }}</span>
                 <span class="text-cp-text-secondary">{{ hour(run.started_ms) }} · {{ statusLabel(run.status, run.level) }}</span>
               </span>
-              <span class="mt-1 block text-cp-xs text-cp-text-tertiary">{{ run.reason || (run.status === 'running' ? '正在等待探测结果' : '没有可用的判定') }}</span>
+              <span v-if="run.reason || run.status === 'running' || !run.level" class="mt-1 block text-cp-xs text-cp-text-tertiary">{{ run.reason || (run.status === 'running' ? '正在等待探测结果' : '没有可用的判定') }}</span>
             </span>
           </button>
         </div>
