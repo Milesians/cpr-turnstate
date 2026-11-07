@@ -1,102 +1,102 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import type { OverviewAccount, Slot } from '../src/api.ts'
-import { accountState, cellState, fitSlots } from '../src/timeline.ts'
+import type { OverviewAccount, Range } from '../src/api.ts'
+import { accountState, cellState, expand, fitSpans, pendingChange, pendingLabel, severity, total, worst } from '../src/timeline.ts'
 
-function slots(): Slot[] {
-  return Array.from({ length: 96 }, (_, i) => ({ start_ms: i * 900000, end_ms: (i + 1) * 900000, level: null, count: 0, running: 0 }))
-}
+const range: Range = { hours: 24, start_ms: 0, slot_ms: 900000, slots: 96 }
 
-test('responsive cells preserve the entire time range and every count', () => {
-  const input = slots()
-  input[0]!.level = 'ok'
-  input[0]!.count = 1
-  input[95]!.level = 'degraded'
-  input[95]!.count = 1
+test('sparse cells expand to the full range in place', () => {
+  const spans = expand(range, [{ i: 0, ok: 1 }, { i: 95, degraded: 2, running: 1 }])
+  assert.equal(spans.length, 96)
+  assert.equal(spans[0]!.start_ms, 0)
+  assert.equal(spans.at(-1)!.end_ms, 24 * 3600000)
+  assert.deepEqual(spans[95]!.counts, { degraded: 2, running: 1 })
+  assert.equal(total(spans[1]!.counts), 0)
+})
+
+test('responsive cells keep the whole range and every count', () => {
+  const spans = expand(range, [{ i: 0, ok: 1 }, { i: 95, degraded: 1 }])
   for (const width of [180, 480, 1200]) {
-    const output = fitSlots(input, width)
-    assert.equal(output.length, Math.min(96, Math.floor(width / 11)))
-    assert.equal(output[0]!.start_ms, 0)
-    assert.equal(output.at(-1)!.end_ms, 24 * 3600000)
-    assert.equal(output.reduce((n, s) => n + s.count, 0), 2)
-    assert.equal(cellState(output.at(-1)!), 'degraded')
-    assert(output.every((s, i) => !i || s.start_ms === output[i - 1]!.end_ms))
+    const out = fitSpans(spans, width)
+    assert.equal(out.length, Math.min(96, Math.floor(width / 11)))
+    assert.equal(out[0]!.start_ms, 0)
+    assert.equal(out.at(-1)!.end_ms, 24 * 3600000)
+    assert.equal(out.reduce((n, s) => n + total(s.counts), 0), 2)
+    assert.equal(cellState(out.at(-1)!.counts), 'degraded')
+    assert(out.every((s, i) => !i || s.start_ms === out[i - 1]!.end_ms))
   }
 })
 
-test('no probe, in progress, failed and unknown are different states', () => {
-  const empty = slots()[0]!
-  assert.equal(cellState(empty), 'empty')
-  assert.equal(cellState({ ...empty, count: 1, running: 1 }), 'running')
-  assert.equal(cellState({ ...empty, count: 2, running: 1 }), 'unknown')
-  assert.equal(cellState({ ...empty, level: 'unknown', count: 1 }), 'unknown')
-  assert.equal(cellState({ ...empty, level: 'ok', count: 2, running: 1 }), 'ok')
+test('no probe, in progress, failed and verdicts are different states', () => {
+  assert.equal(cellState({}), 'empty')
+  assert.equal(cellState({ running: 1 }), 'running')
+  assert.equal(cellState({ failed: 1, running: 1 }), 'unknown')
+  assert.equal(cellState({ unknown: 1 }), 'unknown')
+  assert.equal(cellState({ ok: 2, running: 1 }), 'ok')
+  assert.equal(worst({ ok: 5, suspect: 1 }), 'suspect')
+  assert.equal(worst({ suspect: 5, degraded: 1 }), 'degraded')
 })
 
-test('empty time does not replace real results or hide a worse verdict', () => {
-  const input = slots()
-  input[0]!.level = 'ok'; input[0]!.count = 1
-  input[1]!.level = 'unknown'; input[1]!.count = 1
-  assert.equal(fitSlots(input, 11)[0]!.level, 'ok')
-  input[2]!.level = 'degraded'; input[2]!.count = 1
-  assert.equal(fitSlots(input, 11)[0]!.level, 'degraded')
+test('merging empty time does not hide a worse verdict', () => {
+  const spans = expand(range, [{ i: 0, ok: 1 }, { i: 1, failed: 1 }])
+  assert.equal(cellState(fitSpans(spans, 11)[0]!.counts), 'ok')
+  const worse = expand(range, [{ i: 0, ok: 1 }, { i: 2, degraded: 1 }])
+  assert.equal(cellState(fitSpans(worse, 11)[0]!.counts), 'degraded')
 })
 
-function monitoredAccount(): OverviewAccount {
-  const method = () => ({
-    schedule: { enabled: true, model: 'test-model', interval_minutes: 30 },
-    last_attempt: null, latest: null, slots: slots(),
-    rate: { judged: 0, ok: 0 }, rate_24h: { judged: 0, ok: 0 }, rate_7d: { judged: 0, ok: 0 },
-  })
+function account(): OverviewAccount {
+  const schedule = { enabled: true, model: 'm', interval_minutes: 30 }
   return {
     id: 'a', name: 'Account', email: null, plan_type: null, enabled: true,
     credential_state: 'ready', supported: true, token_expires_ms: null, running: null,
-    methods: {
-      turnstate: { ...method(), health: {
-        level: 'ok', model: 'test-model', candidate: null, streak: 0,
-        changed_ms: 100, last_run_id: 'confirmed', notification_pending: 0,
-        notification_error: null, notifications_dropped: 0,
-      } },
-      modeltrace: method(),
+    health: {
+      level: 'ok', model: 'm', candidate: null, streak: 0, changed_ms: 100, last_run_id: 'confirmed',
+      notification_pending: 0, notification_error: null, notifications_dropped: 0,
     },
+    schedule: { turnstate: schedule, modeltrace: schedule },
+    last_attempt: null,
+    latest: { turnstate: null, modeltrace: null },
+    strip: [{ i: 0, degraded: 3 }],
+    rate: { judged: 0, ok: 0 }, rate_24h: { judged: 0, ok: 0 }, rate_7d: { judged: 0, ok: 0 },
   }
 }
 
-test('confirmed recovery overrides old degraded slots and is independent of time range', () => {
-  const account = monitoredAccount()
-  for (const method of Object.values(account.methods)) {
-    method.slots[0]!.level = 'degraded'
-    method.slots[0]!.count = 1
-  }
-  assert.equal(accountState(account), 'ok')
-  account.methods.turnstate.slots = slots()
-  account.methods.modeltrace.slots = slots()
-  assert.equal(accountState(account), 'ok')
+test('the confirmed verdict wins over raw strip results', () => {
+  const a = account()
+  assert.equal(accountState(a), 'ok')
+  a.health!.level = 'degraded'
+  assert.equal(accountState(a), 'degraded')
+  a.running = 'in-progress'
+  assert.equal(accountState(a), 'running')
 })
 
-test('unconfirmed recovery and regression keep the previous verdict', () => {
-  const account = monitoredAccount()
-  const health = account.methods.turnstate.health!
-  health.level = 'degraded'; health.candidate = 'ok'; health.streak = 2
-  assert.equal(accountState(account), 'degraded')
-  health.level = 'ok'; health.candidate = 'suspect'; health.streak = 2
-  assert.equal(accountState(account), 'ok')
-  health.level = 'unknown'
-  assert.equal(accountState(account), 'unknown')
-  account.running = 'in-progress'
-  assert.equal(accountState(account), 'running')
+test('without a turnstate verdict use the latest ModelTrace', () => {
+  const a = account()
+  a.health!.last_run_id = ''
+  assert.equal(accountState(a), 'empty')
+  a.latest.modeltrace = {
+    id: 'l', model: 'm', trigger: 'manual', started_ms: 1, finished_ms: 2, status: 'done', level: 'suspect', reason: '', detail: true,
+  }
+  assert.equal(accountState(a), 'suspect')
 })
 
-test('without any turnstate result use latest ModelTrace rather than its worst historical slot', () => {
-  const account = monitoredAccount()
-  account.methods.turnstate.health!.last_run_id = ''
-  account.methods.turnstate.health!.level = 'unknown'
-  assert.equal(accountState(account), 'empty')
-  account.methods.modeltrace.latest = {
-    id: 'latest', model: 'modeltrace-model', trigger: 'manual', started_ms: 1, finished_ms: 2,
-    status: 'done', level: 'ok', reason: 'normal', detail: true,
-  }
-  account.methods.modeltrace.slots[0]!.level = 'degraded'
-  account.methods.modeltrace.slots[0]!.count = 1
-  assert.equal(accountState(account), 'ok')
+test('pending change shows whenever the candidate differs from the verdict', () => {
+  const a = account()
+  a.health!.candidate = 'ok'
+  a.health!.streak = 2
+  assert.equal(pendingChange(a), null, 'already ok')
+  a.health!.candidate = 'degraded'
+  assert.deepEqual(pendingChange(a), { to: 'degraded', streak: 2 })
+  assert.equal(pendingLabel('ok', 'degraded', 2), '转降智中 2/3')
+  // 疑似 → 降智也会改变当前判定（不发通知），同样要显示
+  a.health!.level = 'suspect'
+  assert.deepEqual(pendingChange(a), { to: 'degraded', streak: 2 })
+  a.health!.candidate = 'ok'
+  assert.equal(pendingLabel('suspect', 'ok', 1), '恢复中 1/3')
+  assert.equal(pendingLabel('unknown', 'ok', 1), '确认正常中 1/3')
+})
+
+test('problems sort first', () => {
+  const order = (['ok', 'empty', 'degraded', 'suspect', 'unknown'] as const).slice().sort((x, y) => severity[x] - severity[y])
+  assert.deepEqual(order, ['degraded', 'suspect', 'unknown', 'ok', 'empty'])
 })

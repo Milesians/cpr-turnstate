@@ -1,4 +1,4 @@
-import type { Level, Rate, Status } from './api'
+import type { Counts, Level, Rate, Status } from './api'
 
 export const levelLabel: Record<Level, string> = {
   ok: '正常',
@@ -68,4 +68,38 @@ export function interval(minutes: number): string {
   if (minutes % 60 === 0)
     return `每 ${minutes / 60} 小时`
   return `每 ${minutes} 分钟`
+}
+
+/** 多久以前；超过 7 天显示日期 */
+export function ago(ms: number, now = Date.now()): string {
+  if (!ms)
+    return '—'
+  const s = Math.max(0, Math.round((now - ms) / 1000))
+  if (s < 60)
+    return '刚刚'
+  if (s < 3600)
+    return `${Math.floor(s / 60)} 分钟前`
+  if (s < 86400)
+    return `${Math.floor(s / 3600)} 小时前`
+  if (s < 7 * 86400)
+    return `${Math.floor(s / 86400)} 天前`
+  return dateTime(ms)
+}
+
+export function day(ms: number): string {
+  return new Date(ms).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+}
+
+const countLabels = [['ok', '正常'], ['suspect', '疑似'], ['degraded', '降智'], ['unknown', '未判定'], ['failed', '失败'], ['running', '进行中']] as const
+
+/** 次数的文字说明，如“正常 10 · 降智 2” */
+export function countsText(c: Counts): string {
+  return countLabels.filter(([k]) => c[k]).map(([k, label]) => `${label} ${c[k]}`).join(' · ')
+}
+
+/** 次数的各项，用于小图例 */
+export function countItems(c: Counts): { state: keyof Counts, label: string, count: number }[] {
+  return countLabels
+    .filter(([k]) => c[k])
+    .map(([k, label]) => ({ state: k, label, count: c[k]! }))
 }

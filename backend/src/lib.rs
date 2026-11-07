@@ -13,6 +13,7 @@ mod management;
 pub mod modeltrace;
 mod runner;
 mod scheduler;
+pub mod series;
 mod session;
 pub mod store;
 pub mod telegram;
