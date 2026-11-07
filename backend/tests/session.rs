@@ -930,7 +930,7 @@ async fn overview_ranges_include_only_their_records_and_distinguish_empty_slots(
         })
     };
     host.state.insert(
-        ("history".into(), "acct_a/modeltrace".into()),
+        ("history".into(), "acct_a/turnstate".into()),
         (
             json!({"runs":[
                 summary("older",24*20,"done",Some("degraded")),
@@ -943,7 +943,9 @@ async fn overview_ranges_include_only_their_records_and_distinguish_empty_slots(
         ),
     );
     let mut peer = Peer::start(json!({})).await;
-    for (hours, expected_count, judged, ok) in [(24, 96, 1, 1), (168, 84, 2, 1), (720, 120, 3, 1)] {
+    for (hours, expected_count, judged, ok, expected_runs) in
+        [(24, 96, 1, 1, 3), (168, 84, 2, 1, 4), (720, 120, 3, 1, 5)]
+    {
         let (status, body) = peer
             .api(
                 "GET",
@@ -954,7 +956,7 @@ async fn overview_ranges_include_only_their_records_and_distinguish_empty_slots(
             )
             .await;
         assert_eq!(status, 200, "{body}");
-        let method = &body["accounts"][0]["methods"]["modeltrace"];
+        let method = &body["accounts"][0]["methods"]["turnstate"];
         let slots = method["slots"].as_array().unwrap();
         assert_eq!(slots.len(), expected_count);
         assert_eq!(
@@ -962,31 +964,58 @@ async fn overview_ranges_include_only_their_records_and_distinguish_empty_slots(
             json!({"judged":judged,"ok":ok}),
             "failures and empty time must not count as healthy"
         );
+        // 列表不显示 ModelTrace 的时间条
+        assert!(
+            body["accounts"][0]["methods"]["modeltrace"]["slots"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let start = slots[0]["start_ms"].as_i64().unwrap();
         let end = slots.last().unwrap()["end_ms"].as_i64().unwrap();
         assert_eq!(end - start, hours * 3_600_000);
         assert!(
             slots
                 .iter()
-                .any(|s| s["runs"].as_array().unwrap().is_empty() && s["level"].is_null())
+                .any(|s| s["count"] == 0 && s["level"].is_null())
         );
-        let all_runs: Vec<_> = slots
-            .iter()
-            .flat_map(|s| s["runs"].as_array().unwrap())
-            .collect();
-        let failed = all_runs.iter().find(|r| r["id"] == "failed").unwrap();
-        assert_eq!(failed["status"], "failed");
-        let running = all_runs.iter().find(|r| r["id"] == "running").unwrap();
-        assert_eq!(running["status"], "running");
+        // 格子里不再带记录，只带次数
+        assert!(slots.iter().all(|s| s.get("runs").is_none()));
+        let total: u64 = slots.iter().map(|s| s["count"].as_u64().unwrap()).sum();
+        let running: u64 = slots.iter().map(|s| s["running"].as_u64().unwrap()).sum();
+        assert_eq!(total, expected_runs);
+        assert_eq!(running, 1);
+        // 弹层按时间范围取记录，新的在前
+        let (status, page) = peer
+            .api(
+                "GET",
+                "api/runs",
+                &format!("account=acct_a&method=turnstate&from={start}&to={end}"),
+                None,
+                &mut host,
+            )
+            .await;
+        assert_eq!(status, 200, "{page}");
+        let runs = page["runs"].as_array().unwrap();
+        assert_eq!(runs.len() as u64, expected_runs);
+        assert_eq!(runs[0]["id"], "running");
         assert!(
-            running["level"].is_null(),
+            runs[0]["level"].is_null(),
             "a running probe has no verdict yet"
         );
-        for slot in slots {
-            let runs = slot["runs"].as_array().unwrap();
-            if !runs.is_empty() && runs.iter().all(|r| r["status"] == "failed") {
-                assert_eq!(slot["level"], "unknown");
-            }
+        assert_eq!(runs[1]["id"], "failed");
+        assert_eq!(runs[1]["status"], "failed");
+        // 只有失败记录的格子是 unknown
+        let failed_at = runs[1]["started_ms"].as_i64().unwrap();
+        let failed_slot = slots
+            .iter()
+            .find(|s| {
+                s["start_ms"].as_i64().unwrap() <= failed_at
+                    && failed_at < s["end_ms"].as_i64().unwrap()
+            })
+            .unwrap();
+        if failed_slot["count"] == 1 {
+            assert_eq!(failed_slot["level"], "unknown");
         }
     }
     for query in ["hours=0", "hours=1000000", "hours=bad"] {
@@ -1229,4 +1258,73 @@ async fn full_history_drops_oldest_summaries_and_their_details() {
     assert!(host.get("runs", "old-0").is_none());
     // 之后的测票照常写入
     ticket_probe(&mut peer, &mut host, "ok").await;
+}
+
+/// 宿主的管理响应正文最多 1 MiB；超了页面报“插件管理响应状态、内容类型或正文无效”
+#[tokio::test]
+async fn overview_stays_under_the_management_body_limit_for_busy_accounts() {
+    let ids: Vec<String> = (0..16).map(|i| format!("acct_{i}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let mut host = FakeHost::new(&refs);
+    let now = cpr_account_probe::clock::now_ms();
+    let reason = "连续 3 次带回最新的票，每次都被换成新票（KlN 的判据：全部刷新即降智）";
+    for id in &ids {
+        // 每 10 分钟一次，7 天
+        let runs: Vec<Value> = (0..1008)
+            .map(|i| {
+                let started = now - 600_000 * (1008 - i);
+                json!({
+                    "id": format!("{id}-{i}"), "model": "gpt-6-luna", "trigger": "auto",
+                    "started_ms": started, "finished_ms": started + 60_000,
+                    "status": "done", "level": "degraded", "reason": reason, "detail": false,
+                })
+            })
+            .collect();
+        host.state.insert(
+            ("history".into(), format!("{id}/turnstate")),
+            (json!({"runs": runs}), 1),
+        );
+    }
+    let mut peer = Peer::start(json!({})).await;
+    for hours in [24, 168, 720] {
+        let (status, body) = peer
+            .api(
+                "GET",
+                "api/overview",
+                &format!("hours={hours}"),
+                None,
+                &mut host,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let bytes = serde_json::to_vec(&body).unwrap().len();
+        assert!(bytes < 1024 * 1024, "{hours}h overview is {bytes} bytes");
+    }
+    // 弹层只取一个账号一段时间的记录
+    let (status, page) = peer
+        .api(
+            "GET",
+            "api/runs",
+            &format!(
+                "account=acct_0&method=turnstate&from={}&to={}",
+                now - 7_200_000,
+                now + 1
+            ),
+            None,
+            &mut host,
+        )
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["runs"].as_array().unwrap().len(), 12);
+    for bad in [
+        "account=acct_0&method=nope&from=0&to=1",
+        "account=acct_0&method=turnstate&from=x&to=1",
+        "method=turnstate&from=0&to=1",
+    ] {
+        assert_eq!(
+            peer.api("GET", "api/runs", bad, None, &mut host).await.0,
+            400,
+            "{bad}"
+        );
+    }
 }

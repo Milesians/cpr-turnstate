@@ -62,21 +62,15 @@ export interface Summary {
   detail: boolean
 }
 
-export interface SlotRun {
-  id: string
-  started_ms: number
-  model: string
-  status: Status
-  level: Level | null
-  reason: string
-  detail: boolean
-}
-
+/** 时间条的一格只带判定和次数；记录在打开弹层时用 `api.runs` 再取 */
 export interface Slot {
   start_ms: number
   end_ms: number
   level: Level | null
-  runs: SlotRun[]
+  /** 这段时间发起的探测次数 */
+  count: number
+  /** 其中还在进行的次数 */
+  running: number
 }
 
 export interface Rate {
@@ -308,6 +302,8 @@ export const api = {
   overview: (hours = 24) => call<Overview>('GET', 'api/overview', { hours: String(hours) }),
   account: (id: string) => call<AccountDetail>('GET', 'api/account', { id }),
   run: (id: string, account: string) => call<{ run: Run }>('GET', 'api/run', { id, account }),
+  /** 一段时间里的记录，新的在前 */
+  runs: (account: string, method: Method, from: number, to: number) => call<{ runs: Summary[] }>('GET', 'api/runs', { account, method, from: String(from), to: String(to) }),
   models: () => call<Models>('GET', 'api/models'),
   plan: (account_id: string, method: Method, model: string) => call<Plan>('POST', 'api/plan', undefined, { account_id, method, model }),
   probe: (account_id: string, method: Method, model: string) => call<{ run: Run }>('POST', 'api/probe', undefined, { account_id, method, model }),

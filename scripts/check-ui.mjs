@@ -17,7 +17,7 @@ const dist = new URL('../frontend/dist/', import.meta.url)
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const fixture = `
 window.__requests = [];
-const method = () => ({schedule:{enabled:false,model:'gpt-6-astra',interval_minutes:60},last_attempt:null,latest:null,runs:[],slots:Array.from({length:96},(_,i)=>({start_ms:Date.now()-(96-i)*900000,end_ms:Date.now()-(95-i)*900000,level:null,runs:[]})),rate:{judged:0,ok:0},rate_24h:{judged:0,ok:0},rate_7d:{judged:0,ok:0}});
+const method = () => ({schedule:{enabled:false,model:'gpt-6-astra',interval_minutes:60},last_attempt:null,latest:null,runs:[],slots:Array.from({length:96},(_,i)=>({start_ms:Date.now()-(96-i)*900000,end_ms:Date.now()-(95-i)*900000,level:null,count:0,running:0})),rate:{judged:0,ok:0},rate_24h:{judged:0,ok:0},rate_7d:{judged:0,ok:0}});
 const accounts = Array.from({length:40},(_,i)=>({id:'acct_'+i,name:'Account '+i,email:'test'+i+'@example.com',plan_type:'plus',enabled:true,credential_state:'ready',supported:true,token_expires_ms:null,running:null,methods:{turnstate:method(),modeltrace:method()}}));
 accounts[0].methods.turnstate.schedule.model='';accounts[0].methods.modeltrace.schedule.model='';
 accounts[0].methods.turnstate.health={level:'degraded',model:'gpt-6-astra',candidate:'ok',streak:2,changed_ms:Date.now(),last_run_id:'confirmed',notification_pending:1,notification_error:'TG 发送限流，稍后自动重试',notifications_dropped:0};
@@ -31,7 +31,7 @@ window.codexProxyPlugin = {version:2,get theme(){return document.documentElement
      const start=Date.now()-(count-i)*hours*3600000/count;
      const active=index%5!==0&&i>count/3&&i%7!==0;
      const level=index%5===1?'ok':index%5===2&&i>count-9?'degraded':index%5===3?'unknown':'ok';
-     return {start_ms:start,end_ms:start+hours*3600000/count,level:active?level:null,runs:active?[{id:index+'-'+i,started_ms:start+1,model:'gpt-6-astra',status:level==='unknown'?'failed':'done',level,reason:level==='unknown'?'上游连接失败':'模拟判定',detail:true}]:[]}
+     return {start_ms:start,end_ms:start+hours*3600000/count,level:active?level:null,count:active?1:0,running:0}
    });
    m.rate={judged:index%5===0||index%5===3?0:30,ok:index%5===2?27:30};
  }
@@ -44,6 +44,7 @@ window.codexProxyPlugin = {version:2,get theme(){return document.documentElement
  const data = request.path === 'api/overview' ? {now_ms:Date.now(),range_hours:hours,config:{probe_enabled:false,min_interval_minutes:30,fingerprint_sync_hours:6,telegram_enabled:true,telegram_configured:true},bank,accounts}
  : request.path === 'api/telegram/test' ? {sent:true}
  : request.path === 'api/account' ? {account:accounts.find(a=>a.id===new URLSearchParams(request.query).get('id')),config:{probe_enabled:false}}
+ : request.path === 'api/runs' ? {runs:[{id:'r1',model:'gpt-6-luna',trigger:'auto',started_ms:Number(new URLSearchParams(request.query).get('from'))+1,finished_ms:0,status:'done',level:'degraded',reason:'模拟判定',detail:true}]}
  : request.path === 'api/models' ? {bank:[{id:'gpt-6-astra',display_name:'GPT',family:'GPT'}],cpr:['gpt-6-astra'],aliases:{}}
  : request.path === 'api/plan' ? {blockers:[],request:{headers:{'User-Agent':'CPR identity'},body:'request details '.repeat(200)}}
  : (()=>{throw Error('Unexpected request '+request.path)})();
@@ -212,6 +213,12 @@ try {
     await evaluate("document.querySelector('.probe-cell[data-state=empty]').click()",context);
     await sleep(200);
     assert(await evaluate("[...document.querySelectorAll('[role=dialog]')].some(e=>e.textContent.includes('这段时间没有发起探测，不计入正常率'))",context),'Missing no-probe explanation');
+    await evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}))",context);
+    await sleep(200);
+    await evaluate("document.querySelector('.probe-cell:not([data-state=empty])').click()",context);
+    await sleep(300);
+    assert(await evaluate("window.__requests.some(r=>r.path==='api/runs')",context),'Opening a probed cell must load its records');
+    assert(await evaluate("[...document.querySelectorAll('[role=dialog]')].some(e=>e.textContent.includes('模拟判定'))",context),'Loaded records missing from the cell popover');
     await evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}))",context);
     await sleep(200);
     const screenshot=await send('Page.captureScreenshot',{format:'png'});

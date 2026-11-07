@@ -4,14 +4,14 @@ const severity: Level[] = ['unknown', 'ok', 'suspect', 'degraded']
 export type CellState = Level | 'empty' | 'running'
 
 export function cellState(slot: Slot): CellState {
-  if (!slot.runs.length)
+  if (!slot.count)
     return 'empty'
   if (slot.level)
     return slot.level
-  return slot.runs.every(r => r.status === 'running') ? 'running' : 'unknown'
+  return slot.running === slot.count ? 'running' : 'unknown'
 }
 
-/** 合并相邻时间段，保留所有记录；空白时段不会把一次真实判定稀释掉。 */
+/** 合并相邻时间段，保留完整范围和全部次数；空白时段不会把一次真实判定稀释掉。 */
 export function fitSlots(slots: Slot[], width: number): Slot[] {
   const count = Math.max(1, Math.min(slots.length, Math.floor(width / 11)))
   return Array.from({ length: count }, (_, index) => {
@@ -21,7 +21,8 @@ export function fitSlots(slots: Slot[], width: number): Slot[] {
       start_ms: group[0]!.start_ms,
       end_ms: group[group.length - 1]!.end_ms,
       level: levels.length ? levels.reduce((a, b) => severity.indexOf(a) >= severity.indexOf(b) ? a : b) : null,
-      runs: group.flatMap(s => s.runs).sort((a, b) => b.started_ms - a.started_ms),
+      count: group.reduce((n, s) => n + s.count, 0),
+      running: group.reduce((n, s) => n + s.running, 0),
     }
   })
 }

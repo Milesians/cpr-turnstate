@@ -44,6 +44,7 @@ pub fn registration() -> ManagementRegistration {
             route("GET", "api/overview"),
             route("GET", "api/account"),
             route("GET", "api/run"),
+            route("GET", "api/runs"),
             route("GET", "api/models"),
             route("POST", "api/plan"),
             route("POST", "api/probe"),
@@ -149,6 +150,24 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
         ("GET", "api/account") => account_detail(app, host, required(&query, "id")?).await,
         ("GET", "api/run") => {
             run_detail(host, required(&query, "id")?, required(&query, "account")?).await
+        }
+        ("GET", "api/runs") => {
+            let method: Method =
+                serde_json::from_value(Value::String(required(&query, "method")?.to_owned()))
+                    .map_err(|_| ApiError::invalid("探测方法无效"))?;
+            let bound = |name: &str| {
+                required(&query, name)?
+                    .parse::<i64>()
+                    .map_err(|_| ApiError::invalid("时间范围无效"))
+            };
+            runs_between(
+                host,
+                required(&query, "account")?,
+                method,
+                bound("from")?,
+                bound("to")?,
+            )
+            .await
         }
         ("GET", "api/models") => models(app, host).await,
         ("POST", "api/plan") => plan(app, host, decode(call)?).await,
@@ -356,24 +375,18 @@ impl AccountView {
     }
 }
 
-#[derive(Serialize)]
-struct SlotRun {
-    id: String,
-    started_ms: i64,
-    model: String,
-    status: Status,
-    level: Option<Level>,
-    reason: String,
-    detail: bool,
-}
-
+/// 时间条的一格只带判定和次数；这段时间的记录由 `api/runs` 在打开弹层时再取，
+/// 否则 7 天、30 天的总览会超过宿主管理响应 1 MiB 的上限
 #[derive(Serialize)]
 struct Slot {
     start_ms: i64,
     end_ms: i64,
     /// 最严重的判定；探测了但都没判定（失败）是 unknown，没探测为空
     level: Option<Level>,
-    runs: Vec<SlotRun>,
+    /// 这段时间发起的探测次数
+    count: u32,
+    /// 其中还在进行的次数
+    running: u32,
 }
 
 #[derive(Serialize, Default)]
@@ -433,7 +446,8 @@ fn slots(history: &[Summary], now: i64, hours: i64) -> Vec<Slot> {
             start_ms: first + i * step,
             end_ms: first + (i + 1) * step,
             level: None,
-            runs: Vec::new(),
+            count: 0,
+            running: 0,
         })
         .collect();
     for s in history {
@@ -445,15 +459,10 @@ fn slots(history: &[Summary], now: i64, hours: i64) -> Vec<Slot> {
         if let Some(level) = judged_level(s) {
             slot.level = Some(slot.level.map_or(level, |cur| cur.max(level)));
         }
-        slot.runs.push(SlotRun {
-            id: s.id.clone(),
-            started_ms: s.started_ms,
-            model: s.model.clone(),
-            status: s.status,
-            level: s.level,
-            reason: s.reason.clone(),
-            detail: s.detail,
-        });
+        slot.count += 1;
+        if s.status == Status::Running {
+            slot.running += 1;
+        }
     }
     out
 }
@@ -485,7 +494,12 @@ async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, Api
                     .find(|s| s.status != Status::Running)
                     .cloned(),
                 health,
-                slots: slots(&history, now, hours),
+                // 列表只显示测票的时间条（ModelTrace 的记录在账号详情里）
+                slots: if method.schedulable() {
+                    slots(&history, now, hours)
+                } else {
+                    Vec::new()
+                },
                 rate: rate(&history, now - hours * HOUR_MS),
                 rate_24h: rate(&history, now - 24 * HOUR_MS),
                 rate_7d: rate(&history, now - 7 * 24 * HOUR_MS),
@@ -512,6 +526,24 @@ async fn overview(app: &App, host: &HostClient, hours: i64) -> Result<Value, Api
         "bank": app.runner.bank.current().info,
         "accounts": views,
     }))
+}
+
+/// 时间条一格（或合并后的几格）里的记录，新的在前
+async fn runs_between(
+    host: &HostClient,
+    account_id: &str,
+    method: Method,
+    from: i64,
+    to: i64,
+) -> Result<Value, ApiError> {
+    supported_account(host, account_id).await?;
+    let (history, _) = store::history_with_health(host, account_id, method).await?;
+    let mut runs: Vec<Summary> = history
+        .into_iter()
+        .filter(|s| s.started_ms >= from && s.started_ms < to)
+        .collect();
+    runs.reverse();
+    Ok(json!({"runs": runs}))
 }
 
 async fn account_detail(app: &App, host: &HostClient, id: &str) -> Result<Value, ApiError> {

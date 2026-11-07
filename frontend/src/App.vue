@@ -173,7 +173,7 @@ onMounted(() => Promise.all([load(), loadModels()]))
             <div class="monitor-tracks">
               <div v-for="m in scheduledMethods" :key="m" class="monitor-track">
                 <span class="track-label">{{ methodLabel[m] }}</span>
-                <ProbeStrip :slots="a.methods[m].slots" @open="run => selected = { id: a.id, run }" />
+                <ProbeStrip :slots="a.methods[m].slots" :account-id="a.id" :method="m" @open="run => selected = { id: a.id, run }" />
                 <span class="track-rate" :class="{ 'rate-empty': !a.methods[m].rate.judged }" :title="`${rangeLabel}内 ${a.methods[m].rate.ok} / ${a.methods[m].rate.judged} 次有效判定为正常；失败、未判定和无探测不计入`">{{ rate(a.methods[m].rate) }}</span>
               </div>
             </div>

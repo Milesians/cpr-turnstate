@@ -1,15 +1,32 @@
 <script setup lang="ts">
-import type { Slot } from '../api'
+import type { Method, Slot, Summary } from '../api'
 import { ZPopover } from '@codex-proxy/ui'
-import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, useTemplateRef } from 'vue'
+import { api } from '../api'
 import { dateTime, hour, statusLabel } from '../format'
 import { cellState, fitSlots, stateLabel } from '../timeline'
 
-const props = defineProps<{ slots: Slot[] }>()
+const props = defineProps<{ slots: Slot[], accountId: string, method: Method }>()
 const emit = defineEmits<{ open: [runId: string] }>()
 const strip = useTemplateRef('strip')
 const width = ref(550)
 const cells = computed(() => props.slots.length ? fitSlots(props.slots, width.value) : [])
+/** 打开弹层时才取这一格的记录；按格子起止时间记，每次打开都重新取 */
+const records = reactive(new Map<string, Summary[] | 'loading' | string>())
+const key = (slot: Slot) => `${slot.start_ms}-${slot.end_ms}`
+async function load(slot: Slot) {
+  if (!slot.count)
+    return
+  const k = key(slot)
+  if (!Array.isArray(records.get(k)))
+    records.set(k, 'loading')
+  try {
+    records.set(k, (await api.runs(props.accountId, props.method, slot.start_ms, slot.end_ms)).runs)
+  }
+  catch (e) {
+    records.set(k, e instanceof Error ? e.message : '读取记录失败')
+  }
+}
 let observer: ResizeObserver | undefined
 onMounted(() => {
   observer = new ResizeObserver(([entry]) => {
@@ -24,29 +41,32 @@ onBeforeUnmount(() => observer?.disconnect())
 
 <template>
   <div ref="strip" class="probe-strip" aria-label="探测时间条">
-    <ZPopover v-for="slot in cells" :key="slot.start_ms" trigger="hover-click" placement="top" :hover-delay="80" role="dialog">
+    <ZPopover v-for="slot in cells" :key="slot.start_ms" trigger="hover-click" placement="top" :hover-delay="80" role="dialog" @open="load(slot)">
       <template #reference>
         <button
           type="button"
           class="probe-cell"
           :data-state="cellState(slot)"
-          :aria-label="`${dateTime(slot.start_ms)} – ${dateTime(slot.end_ms)} · ${stateLabel[cellState(slot)]} · ${slot.runs.length} 次探测`"
+          :aria-label="`${dateTime(slot.start_ms)} – ${dateTime(slot.end_ms)} · ${stateLabel[cellState(slot)]} · ${slot.count} 次探测`"
         />
       </template>
       <div class="probe-tooltip">
         <div class="flex items-center justify-between gap-4">
           <strong class="text-cp-text">{{ stateLabel[cellState(slot)] }}</strong>
-          <span class="text-cp-xs text-cp-text-tertiary">{{ slot.runs.length }} 次探测</span>
+          <span class="text-cp-xs text-cp-text-tertiary">{{ slot.count }} 次探测</span>
         </div>
         <div class="text-cp-xs tabular-nums text-cp-text-secondary">
           {{ dateTime(slot.start_ms) }} — {{ dateTime(slot.end_ms) }}
         </div>
-        <p v-if="!slot.runs.length" class="m-0 py-2 text-cp-sm text-cp-text-secondary">
+        <p v-if="!slot.count" class="m-0 py-2 text-cp-sm text-cp-text-secondary">
           这段时间没有发起探测，不计入正常率。
+        </p>
+        <p v-else-if="!Array.isArray(records.get(key(slot)))" class="m-0 py-2 text-cp-sm text-cp-text-secondary">
+          {{ records.get(key(slot)) === 'loading' || !records.has(key(slot)) ? '正在读取记录…' : records.get(key(slot)) }}
         </p>
         <div v-else class="mt-1 flex max-h-64 flex-col gap-1 overflow-y-auto">
           <button
-            v-for="run in slot.runs" :key="run.id" type="button"
+            v-for="run in records.get(key(slot)) as Summary[]" :key="run.id" type="button"
             class="flex items-start gap-2.5 rounded-cp px-2 py-2 text-left hover:bg-cp-fill-quaternary disabled:cursor-default"
             :disabled="!run.detail" @click="emit('open', run.id)"
           >
