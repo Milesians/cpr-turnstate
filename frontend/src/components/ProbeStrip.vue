@@ -5,13 +5,15 @@ import { ZPopover } from '@codex-proxy/ui'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, useTemplateRef } from 'vue'
 import { api } from '../api'
 import { countItems, dateTime, hour, statusLabel } from '../format'
-import { cellState, expand, fitSpans, stateLabel, total } from '../timeline'
+import { cellState, expand, fitSpans, stateLabel, stripLayout, total } from '../timeline'
 
 const props = defineProps<{ range: Range, cells: Cell[], accountId: string, method: Method }>()
 const emit = defineEmits<{ open: [runId: string] }>()
 const strip = useTemplateRef('strip')
 const width = ref(550)
-const spans = computed(() => fitSpans(expand(props.range, props.cells), width.value))
+const dpr = ref(typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1)
+const layout = computed(() => stripLayout(props.range.slots, width.value, dpr.value))
+const spans = computed(() => fitSpans(expand(props.range, props.cells), layout.value.count))
 
 /** 打开一格时才取这段时间的记录；每次打开都重新取 */
 const pages = reactive(new Map<string, RunsPage | 'loading' | { error: string }>())
@@ -41,8 +43,10 @@ function pageError(s: Span) {
 let observer: ResizeObserver | undefined
 onMounted(() => {
   observer = new ResizeObserver(([entry]) => {
-    if (entry)
+    if (entry) {
       width.value = entry.contentRect.width
+      dpr.value = window.devicePixelRatio || 1
+    }
   })
   if (strip.value)
     observer.observe(strip.value)
@@ -51,12 +55,13 @@ onBeforeUnmount(() => observer?.disconnect())
 </script>
 
 <template>
-  <div ref="strip" class="probe-strip" aria-label="探测时间条">
-    <ZPopover v-for="s in spans" :key="s.start_ms" trigger="hover-click" placement="top" :hover-delay="80" role="dialog" @open="load(s)">
+  <div ref="strip" class="probe-strip" aria-label="探测时间条" :style="{ columnGap: `${layout.gap}px` }">
+    <ZPopover v-for="(s, i) in spans" :key="s.start_ms" trigger="hover-click" placement="top" :hover-delay="80" role="dialog" @open="load(s)">
       <template #reference>
         <button
           type="button"
           class="probe-cell"
+          :style="{ width: `${layout.widths[i]}px` }"
           :data-state="cellState(s.counts)"
           :aria-label="`${dateTime(s.start_ms)} – ${dateTime(s.end_ms)} · ${stateLabel[cellState(s.counts)]} · ${total(s.counts)} 次探测`"
         />

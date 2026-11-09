@@ -63,11 +63,44 @@ export function expand(range: Range, cells: Cell[]): Span[] {
   return spans
 }
 
-/** 按可用宽度合并相邻时段，保留完整范围和全部次数；空白时段不会稀释一次真实判定 */
-export function fitSpans(spans: Span[], width: number, cellWidth = 11): Span[] {
+/** 时间条怎么画：几格、格间距和每格宽度（CSS 像素，按设备像素取整） */
+export interface StripLayout {
+  count: number
+  gap: number
+  widths: number[]
+}
+
+/** 一格（含间距）最窄几个 CSS 像素；更窄就合并相邻时段 */
+export const MIN_PITCH = 7
+
+/**
+ * 按可用宽度决定时间条的格数和间距。
+ * 格数只取总时段数的约数，每格都是同样长的一段时间（不会一格 15 分钟、一格 30 分钟）；
+ * 间距随格宽变（约四分之一，1–3 像素）；宽度按设备像素取整，余下的像素均匀分给各格，
+ * 避免小数像素让有的间距看不见、有的格子粘在一起。
+ */
+export function stripLayout(slots: number, width: number, dpr = 1): StripLayout {
+  const ratio = dpr > 0 ? dpr : 1
+  const device = Math.max(0, Math.floor(width * ratio))
+  let count = 1
+  for (let n = Math.max(1, slots); n >= 1; n--) {
+    if (slots % n === 0 && device / n >= MIN_PITCH * ratio) {
+      count = n
+      break
+    }
+  }
+  const pitch = device / count
+  const gap = count > 1 ? Math.min(3 * ratio, Math.max(Math.round(ratio), Math.round(pitch / 4))) : 0
+  const free = Math.max(count, device - (count - 1) * gap)
+  const widths = Array.from({ length: count }, (_, i) => (Math.floor((i + 1) * free / count) - Math.floor(i * free / count)) / ratio)
+  return { count, gap: gap / ratio, widths }
+}
+
+/** 把时段合并成 count 格，保留完整范围和全部次数；空白时段不会稀释一次真实判定 */
+export function fitSpans(spans: Span[], count: number): Span[] {
   if (!spans.length)
     return []
-  const count = Math.max(1, Math.min(spans.length, Math.floor(width / cellWidth)))
+  count = Math.max(1, Math.min(spans.length, Math.floor(count)))
   return Array.from({ length: count }, (_, index) => {
     const group = spans.slice(Math.floor(index * spans.length / count), Math.floor((index + 1) * spans.length / count))
     return {

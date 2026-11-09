@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { OverviewAccount, Range } from '../src/api.ts'
-import { accountState, blockedLabel, cellState, expand, fitSpans, isBlocked, needsAttention, pendingChange, pendingLabel, rank, severity, total, worst } from '../src/timeline.ts'
+import { accountState, blockedLabel, cellState, expand, fitSpans, isBlocked, MIN_PITCH, needsAttention, pendingChange, pendingLabel, rank, severity, stripLayout, total, worst } from '../src/timeline.ts'
 
 const range: Range = { hours: 24, start_ms: 0, slot_ms: 900000, slots: 96 }
 
@@ -17,14 +17,40 @@ test('sparse cells expand to the full range in place', () => {
 test('responsive cells keep the whole range and every count', () => {
   const spans = expand(range, [{ i: 0, ok: 1 }, { i: 95, degraded: 1 }])
   for (const width of [180, 480, 1200]) {
-    const out = fitSpans(spans, width)
-    assert.equal(out.length, Math.min(96, Math.floor(width / 11)))
+    const { count } = stripLayout(96, width)
+    const out = fitSpans(spans, count)
+    assert.equal(out.length, count)
     assert.equal(out[0]!.start_ms, 0)
     assert.equal(out.at(-1)!.end_ms, 24 * 3600000)
     assert.equal(out.reduce((n, s) => n + total(s.counts), 0), 2)
     assert.equal(cellState(out.at(-1)!.counts), 'degraded')
     assert(out.every((s, i) => !i || s.start_ms === out[i - 1]!.end_ms))
+    // 每格是同样长的一段时间
+    assert(out.every(s => s.end_ms - s.start_ms === out[0]!.end_ms - out[0]!.start_ms))
   }
+})
+
+test('strip layout picks an even split, snaps to device pixels and scales the gap', () => {
+  for (const [slots, width, dpr] of [[96, 1170, 2], [96, 1170.4, 1], [96, 600, 1], [96, 300, 1.5], [84, 700, 1], [120, 500, 2], [120, 50, 1]] as const) {
+    const { count, gap, widths } = stripLayout(slots, width, dpr)
+    assert.equal(slots % count, 0, `${slots}@${width}`)
+    assert(width / count >= MIN_PITCH || count === 1)
+    // 再多一档就太挤
+    const next = Array.from({ length: slots }, (_, i) => i + 1).find(n => n > count && slots % n === 0)
+    if (next)
+      assert(Math.floor(width * dpr) / next < MIN_PITCH * dpr)
+    assert.equal(widths.length, count)
+    const used = widths.reduce((a, b) => a + b, 0) + gap * (count - 1)
+    assert(used <= width + 1e-9 && width - used < count / dpr + 1)
+    for (const w of [...widths, gap])
+      assert.equal(Math.abs(w * dpr - Math.round(w * dpr)) < 1e-9, true)
+    assert(Math.max(...widths) - Math.min(...widths) <= 1 / dpr + 1e-9)
+    assert(gap >= 1 / dpr && gap <= 3)
+  }
+  assert.equal(stripLayout(96, 1170, 2).count, 96)
+  assert.equal(stripLayout(96, 1170, 2).gap, 3)
+  assert.equal(stripLayout(96, 600, 1).count, 48)
+  assert.equal(stripLayout(96, 300, 1).count, 32)
 })
 
 test('no probe, in progress, failed and verdicts are different states', () => {
@@ -39,9 +65,9 @@ test('no probe, in progress, failed and verdicts are different states', () => {
 
 test('merging empty time does not hide a worse verdict', () => {
   const spans = expand(range, [{ i: 0, ok: 1 }, { i: 1, failed: 1 }])
-  assert.equal(cellState(fitSpans(spans, 11)[0]!.counts), 'ok')
+  assert.equal(cellState(fitSpans(spans, 1)[0]!.counts), 'ok')
   const worse = expand(range, [{ i: 0, ok: 1 }, { i: 2, degraded: 1 }])
-  assert.equal(cellState(fitSpans(worse, 11)[0]!.counts), 'degraded')
+  assert.equal(cellState(fitSpans(worse, 1)[0]!.counts), 'degraded')
 })
 
 function account(): OverviewAccount {
