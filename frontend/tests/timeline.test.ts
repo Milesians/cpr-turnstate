@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { OverviewAccount, Range } from '../src/api.ts'
-import { accountState, blockedLabel, cellState, expand, fitSpans, isBlocked, MIN_PITCH, needsAttention, pendingChange, pendingLabel, rank, severity, stripLayout, total, worst } from '../src/timeline.ts'
+import { accountState, blockedLabel, cellSpan, cellState, expand, floorBj, groupSpans, isBlocked, MIN_PITCH, needsAttention, pendingChange, pendingLabel, probeInterval, rank, severity, stripLayout, total, worst } from '../src/timeline.ts'
 
 const range: Range = { hours: 24, start_ms: 0, slot_ms: 900000, slots: 96 }
 
@@ -14,43 +14,80 @@ test('sparse cells expand to the full range in place', () => {
   assert.equal(total(spans[1]!.counts), 0)
 })
 
+const MIN = 60_000
+const HOUR = 60 * MIN
+// 北京时间 00:00 起的 24 小时（对齐）
+const day0 = floorBj(1_794_026_096_000, 24 * HOUR)
+const aligned: Range = { hours: 24, start_ms: day0, slot_ms: 15 * MIN, slots: 96 }
+// 起点在 xx:15，不在 30 分钟边界上
+const shifted: Range = { ...aligned, start_ms: day0 + 15 * MIN }
+
+function check(out: ReturnType<typeof groupSpans>, r: Range, n: number) {
+  assert.equal(out[0]!.start_ms, r.start_ms)
+  assert.equal(out.at(-1)!.end_ms, r.start_ms + r.slots * r.slot_ms)
+  assert(out.every((s, i) => !i || s.start_ms === out[i - 1]!.end_ms))
+  assert.equal(out.reduce((c, s) => c + total(s.counts), 0), n)
+}
+
 test('responsive cells keep the whole range and every count', () => {
-  const spans = expand(range, [{ i: 0, ok: 1 }, { i: 95, degraded: 1 }])
-  for (const width of [180, 480, 1200]) {
-    const { count } = stripLayout(96, width)
-    const out = fitSpans(spans, count)
-    assert.equal(out.length, count)
-    assert.equal(out[0]!.start_ms, 0)
-    assert.equal(out.at(-1)!.end_ms, 24 * 3600000)
-    assert.equal(out.reduce((n, s) => n + total(s.counts), 0), 2)
-    assert.equal(cellState(out.at(-1)!.counts), 'degraded')
-    assert(out.every((s, i) => !i || s.start_ms === out[i - 1]!.end_ms))
-    // 每格是同样长的一段时间
-    assert(out.every(s => s.end_ms - s.start_ms === out[0]!.end_ms - out[0]!.start_ms))
+  for (const r of [aligned, shifted]) {
+    const spans = expand(r, [{ i: 0, ok: 1 }, { i: 95, degraded: 1 }])
+    for (const width of [180, 480, 1200]) {
+      const out = groupSpans(spans, cellSpan(r, width))
+      check(out, r, 2)
+      assert(width / out.length >= MIN_PITCH)
+      assert.equal(cellState(out.at(-1)!.counts), 'degraded')
+    }
   }
+  assert.equal(groupSpans(expand(aligned, []), cellSpan(aligned, 1200)).length, 96)
+  assert.equal(groupSpans(expand(aligned, []), cellSpan(aligned, 600)).length, 48)
 })
 
-test('strip layout picks an even split, snaps to device pixels and scales the gap', () => {
-  for (const [slots, width, dpr] of [[96, 1170, 2], [96, 1170.4, 1], [96, 600, 1], [96, 300, 1.5], [84, 700, 1], [120, 500, 2], [120, 50, 1]] as const) {
-    const { count, gap, widths } = stripLayout(slots, width, dpr)
-    assert.equal(slots % count, 0, `${slots}@${width}`)
-    assert(width / count >= MIN_PITCH || count === 1)
-    // 再多一档就太挤
-    const next = Array.from({ length: slots }, (_, i) => i + 1).find(n => n > count && slots % n === 0)
-    if (next)
-      assert(Math.floor(width * dpr) / next < MIN_PITCH * dpr)
+test('cells are no shorter than the probe interval, so every cell holds one probe', () => {
+  // 每 30 分钟一次（整点和半点），宽度足够画 96 格时也按 30 分钟一格，没有空格
+  for (const r of [aligned, shifted]) {
+    const cells = Array.from({ length: 96 }, (_, i) => i)
+      .filter(i => (r.start_ms + i * r.slot_ms - day0) % (30 * MIN) === 0)
+      .map(i => ({ i, ok: 1 }))
+    const span = cellSpan(r, 1300, 30 * MIN)
+    assert.equal(span, 30 * MIN)
+    const out = groupSpans(expand(r, cells), span)
+    check(out, r, cells.length)
+    assert(out.every(s => total(s.counts) >= 1), 'no empty cell')
+    // 边界落在半点上；起点不对齐时开头不满一格的并进第一格
+    assert(out.slice(1).every(s => floorBj(s.start_ms, 30 * MIN) === s.start_ms))
+  }
+  assert.equal(groupSpans(expand(shifted, []), 30 * MIN).length, 48)
+  // 45 分钟能整除一天，也按 45 分钟；60 分钟、2 小时同理
+  assert.equal(cellSpan(aligned, 1300, 45 * MIN), 45 * MIN)
+  assert.equal(cellSpan(aligned, 1300, 60 * MIN), HOUR)
+  assert.equal(cellSpan(aligned, 1300, 50 * MIN), HOUR)
+  // 太窄时再加长
+  assert(cellSpan(aligned, 150, 30 * MIN) > 30 * MIN)
+  // 7 天范围本来就 2 小时一格
+  const week: Range = { hours: 168, start_ms: day0, slot_ms: 2 * HOUR, slots: 84 }
+  assert.equal(cellSpan(week, 1300, 30 * MIN), 2 * HOUR)
+})
+
+test('probe interval honours the global minimum', () => {
+  const s = { enabled: true, model: 'm', interval_minutes: 15 }
+  assert.equal(probeInterval({ schedule: { turnstate: s, modeltrace: s } }, 30), 30 * MIN)
+  assert.equal(probeInterval({ schedule: { turnstate: { ...s, interval_minutes: 60 }, modeltrace: s } }, 30), HOUR)
+})
+
+test('strip layout snaps to device pixels and scales the gap', () => {
+  for (const [count, width, dpr] of [[96, 1170, 2], [96, 1170.4, 1], [48, 600, 1], [32, 300, 1.5], [84, 700, 1], [60, 500, 2], [1, 50, 1]] as const) {
+    const { gap, widths } = stripLayout(count, width, dpr)
     assert.equal(widths.length, count)
     const used = widths.reduce((a, b) => a + b, 0) + gap * (count - 1)
     assert(used <= width + 1e-9 && width - used < count / dpr + 1)
     for (const w of [...widths, gap])
       assert.equal(Math.abs(w * dpr - Math.round(w * dpr)) < 1e-9, true)
     assert(Math.max(...widths) - Math.min(...widths) <= 1 / dpr + 1e-9)
-    assert(gap >= 1 / dpr && gap <= 3)
+    if (count > 1)
+      assert(gap >= 1 / dpr && gap <= 3)
   }
-  assert.equal(stripLayout(96, 1170, 2).count, 96)
   assert.equal(stripLayout(96, 1170, 2).gap, 3)
-  assert.equal(stripLayout(96, 600, 1).count, 48)
-  assert.equal(stripLayout(96, 300, 1).count, 32)
 })
 
 test('no probe, in progress, failed and verdicts are different states', () => {
@@ -65,9 +102,9 @@ test('no probe, in progress, failed and verdicts are different states', () => {
 
 test('merging empty time does not hide a worse verdict', () => {
   const spans = expand(range, [{ i: 0, ok: 1 }, { i: 1, failed: 1 }])
-  assert.equal(cellState(fitSpans(spans, 1)[0]!.counts), 'ok')
+  assert.equal(cellState(groupSpans(spans, 24 * HOUR)[0]!.counts), 'ok')
   const worse = expand(range, [{ i: 0, ok: 1 }, { i: 2, degraded: 1 }])
-  assert.equal(cellState(fitSpans(worse, 1)[0]!.counts), 'degraded')
+  assert.equal(cellState(groupSpans(worse, 24 * HOUR)[0]!.counts), 'degraded')
 })
 
 function account(): OverviewAccount {

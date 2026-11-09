@@ -5,7 +5,7 @@ import { ZButton, ZCheckbox, ZEmpty, ZInput, ZSegmented, ZSelect } from '@codex-
 import { ChevronRight, Search } from '@lucide/vue'
 import { computed, ref, watch } from 'vue'
 import { ago, rate, span } from '../format'
-import { accountState, blockedLabel, isBlocked, needsAttention, pendingChange, pendingLabel, rank, stateLabel } from '../timeline'
+import { accountState, blockedLabel, isBlocked, needsAttention, pendingChange, pendingLabel, probeInterval, rank, stateLabel } from '../timeline'
 import ProbeStrip from './ProbeStrip.vue'
 
 const props = defineProps<{ overview: Overview | null, loading: boolean }>()
@@ -186,7 +186,7 @@ function schedule(a: OverviewAccount) {
         </span>
       </button>
       <div class="monitor-strip">
-        <ProbeStrip v-if="overview && a.supported" :range="overview.range" :cells="a.strip" :account-id="a.id" method="turnstate" @open="run => emit('open', a.id, run)" />
+        <ProbeStrip v-if="overview && a.supported" :range="overview.range" :cells="a.strip" :interval-ms="probeInterval(a, overview.config.min_interval_minutes)" :account-id="a.id" method="turnstate" @open="run => emit('open', a.id, run)" />
         <span v-else class="text-cp-xs text-cp-text-tertiary">非 OpenAI OAuth 账号，不探测</span>
       </div>
       <span class="track-rate" :class="{ 'rate-empty': !a.rate.judged }" :title="`${rangeLabel}内 ${a.rate.ok} / ${a.rate.judged} 次有效判定为正常；失败、未判定和无探测不计入`">{{ rate(a.rate) }}</span>

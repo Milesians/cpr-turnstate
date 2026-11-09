@@ -5,15 +5,17 @@ import { ZPopover } from '@codex-proxy/ui'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, useTemplateRef } from 'vue'
 import { api } from '../api'
 import { countItems, dateTime, hour, statusLabel } from '../format'
-import { cellState, expand, fitSpans, stateLabel, stripLayout, total } from '../timeline'
+import { cellSpan, cellState, expand, groupSpans, stateLabel, stripLayout, total } from '../timeline'
 
-const props = defineProps<{ range: Range, cells: Cell[], accountId: string, method: Method }>()
+/** intervalMs：自动探测的间隔，每格不短于它 */
+const props = defineProps<{ range: Range, cells: Cell[], accountId: string, method: Method, intervalMs?: number }>()
 const emit = defineEmits<{ open: [runId: string] }>()
 const strip = useTemplateRef('strip')
 const width = ref(550)
 const dpr = ref(typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1)
-const layout = computed(() => stripLayout(props.range.slots, width.value, dpr.value))
-const spans = computed(() => fitSpans(expand(props.range, props.cells), layout.value.count))
+const span = computed(() => cellSpan(props.range, width.value, props.intervalMs ?? 0, dpr.value))
+const spans = computed(() => groupSpans(expand(props.range, props.cells), span.value))
+const layout = computed(() => stripLayout(spans.value.length, width.value, dpr.value))
 
 /** 打开一格时才取这段时间的记录；每次打开都重新取 */
 const pages = reactive(new Map<string, RunsPage | 'loading' | { error: string }>())

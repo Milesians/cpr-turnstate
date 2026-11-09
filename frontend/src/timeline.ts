@@ -73,22 +73,73 @@ export interface StripLayout {
 /** 一格（含间距）最窄几个 CSS 像素；更窄就合并相邻时段 */
 export const MIN_PITCH = 7
 
+const DAY_MS = 86_400_000
+/** 北京时间相对 UTC 的偏移；格子和自动探测都按北京时间对齐 */
+const OFFSET_MS = 8 * 3_600_000
+
+/** 把 t 按北京时间向下对齐到 step 的整数倍（和后端 series::floor 一样） */
+export function floorBj(t: number, step: number): number {
+  return Math.floor((t + OFFSET_MS) / step) * step - OFFSET_MS
+}
+
 /**
- * 按可用宽度决定时间条的格数和间距。
- * 格数只取总时段数的约数，每格都是同样长的一段时间（不会一格 15 分钟、一格 30 分钟）；
- * 间距随格宽变（约四分之一，1–3 像素）；宽度按设备像素取整，余下的像素均匀分给各格，
- * 避免小数像素让有的间距看不见、有的格子粘在一起。
+ * 把时段按北京时间对齐合并成每格 span 长：边界落在 span 的整数倍上（自动探测也按同样的段发起，
+ * 每格正好一次）。范围起点不在边界上时，开头不满一格的并进下一格；最后一格是现在所在的一段，可能还不满。
+ * 保留完整范围和全部次数；空白时段不会稀释一次真实判定。
  */
-export function stripLayout(slots: number, width: number, dpr = 1): StripLayout {
-  const ratio = dpr > 0 ? dpr : 1
-  const device = Math.max(0, Math.floor(width * ratio))
-  let count = 1
-  for (let n = Math.max(1, slots); n >= 1; n--) {
-    if (slots % n === 0 && device / n >= MIN_PITCH * ratio) {
-      count = n
-      break
+export function groupSpans(spans: Span[], span: number): Span[] {
+  const out: Span[] = []
+  let key = Number.NaN
+  for (const s of spans) {
+    const at = floorBj(s.start_ms, span)
+    const last = out.at(-1)
+    if (last && at === key) {
+      last.end_ms = s.end_ms
+      last.counts = merge(last.counts, s.counts)
+    }
+    else {
+      out.push({ ...s })
+      key = at
     }
   }
+  const [head, next] = out
+  if (head && next && floorBj(head.start_ms, span) !== head.start_ms)
+    out.splice(0, 2, { start_ms: head.start_ms, end_ms: next.end_ms, counts: merge(head.counts, next.counts) })
+  return out
+}
+
+/**
+ * 每格多长：时段的整数倍，并且能整除一天（或是整天的倍数），格子边界落在整点。
+ * 不短于探测间隔——每 30 分钟探测一次就 30 分钟一格，不会一格有、一格空；
+ * 宽度不够时再加长，每格（含间距）不窄于 MIN_PITCH。
+ */
+export function cellSpan(range: Range, width: number, intervalMs = 0, dpr = 1): number {
+  const ratio = dpr > 0 ? dpr : 1
+  const device = Math.max(0, Math.floor(width * ratio))
+  const spans = expand(range, [])
+  let fallback = range.slot_ms * Math.max(1, range.slots)
+  for (let k = 1; k <= range.slots; k++) {
+    const span = k * range.slot_ms
+    if (DAY_MS % span !== 0 && span % DAY_MS !== 0)
+      continue
+    if (span < intervalMs)
+      continue
+    const count = groupSpans(spans, span).length
+    if (count <= 1 || device / count >= MIN_PITCH * ratio)
+      return span
+    fallback = span
+  }
+  return fallback
+}
+
+/**
+ * 按可用宽度画 count 格：间距随格宽变（约四分之一，1–3 像素）；宽度按设备像素取整，
+ * 余下的像素均匀分给各格，避免小数像素让有的间距看不见、有的格子粘在一起。
+ */
+export function stripLayout(count: number, width: number, dpr = 1): StripLayout {
+  const ratio = dpr > 0 ? dpr : 1
+  const device = Math.max(0, Math.floor(width * ratio))
+  count = Math.max(1, Math.floor(count))
   const pitch = device / count
   const gap = count > 1 ? Math.min(3 * ratio, Math.max(Math.round(ratio), Math.round(pitch / 4))) : 0
   const free = Math.max(count, device - (count - 1) * gap)
@@ -96,19 +147,9 @@ export function stripLayout(slots: number, width: number, dpr = 1): StripLayout 
   return { count, gap: gap / ratio, widths }
 }
 
-/** 把时段合并成 count 格，保留完整范围和全部次数；空白时段不会稀释一次真实判定 */
-export function fitSpans(spans: Span[], count: number): Span[] {
-  if (!spans.length)
-    return []
-  count = Math.max(1, Math.min(spans.length, Math.floor(count)))
-  return Array.from({ length: count }, (_, index) => {
-    const group = spans.slice(Math.floor(index * spans.length / count), Math.floor((index + 1) * spans.length / count))
-    return {
-      start_ms: group[0]!.start_ms,
-      end_ms: group[group.length - 1]!.end_ms,
-      counts: group.reduce<Counts>((c, s) => merge(c, s.counts), {}),
-    }
-  })
+/** 账号自动测票的实际间隔（毫秒）：设置的间隔，不短于全局最短间隔；关了自动探测也按它（历史多半是它发的） */
+export function probeInterval(account: Pick<OverviewAccount, 'schedule'>, minIntervalMinutes: number): number {
+  return Math.max(account.schedule.turnstate.interval_minutes, minIntervalMinutes) * 60_000
 }
 
 /**
