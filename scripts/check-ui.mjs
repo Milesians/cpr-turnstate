@@ -69,7 +69,7 @@ function detailOf(a){
     modeltrace:{schedule:a.schedule.modeltrace,last_attempt:null,health:null,runs:[{...summary(a.id+'-mt',26*H,'ok'),model:'gpt-6.1-sol',trigger:'manual',reason:'gpt-6.1-sol 的概率 82%，最像它'}],daily:daily.map(d=>({start_ms:d.start_ms})),raw_since:null},
   }};
 }
-const groups = {enabled:true,max_rules:8,admin_error:null,plans:['plus','pro','team','free'],
+const groups = {enabled:true,max_rules:8,plans:['plus','pro','team','free'],
   rules:[{id:'g1',name:'测票正常',color:'#22C55EFF',levels:['ok'],plans:[]},{id:'g2',group_id:'cpr-1',name:'PRO 异常',color:'#EF4444FF',levels:['suspect','degraded'],plans:['pro']}],
   status:{synced_ms:now-1800000,rules:{g1:{group_id:'x1',group_name:'测票正常'},g2:{group_id:'cpr-1',group_name:'PRO 异常'}},changes:[{account_id:'acct_7',from:'ok',to:'degraded',at_ms:now-1200000,added:['PRO 异常'],removed:['测票正常']}]}};
 window.codexProxyPlugin = {version:2,get theme(){return document.documentElement.dataset.theme},request:async request=>{

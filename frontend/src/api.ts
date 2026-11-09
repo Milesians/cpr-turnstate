@@ -314,8 +314,6 @@ export interface GroupsView {
   rules: GroupRule[]
   max_rules: number
   status: { synced_ms: number, error?: string, rules: Record<string, GroupRuleStatus>, changes: GroupChange[] }
-  /** 没配好 CPR 地址或管理 API Key 时的原因；为空表示可以选现有分组 */
-  admin_error?: string | null
   /** CPR 里可探测账号现有的账号类型 */
   plans: string[]
 }

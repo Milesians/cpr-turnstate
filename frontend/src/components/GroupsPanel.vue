@@ -75,10 +75,6 @@ function fill(v: GroupsView) {
 
 async function loadCprGroups() {
   cprError.value = ''
-  if (view.value?.admin_error) {
-    cprGroups.value = []
-    return
-  }
   try { cprGroups.value = (await api.cprGroups()).groups }
   catch (e) { cprError.value = (e as Error).message }
 }
@@ -154,7 +150,7 @@ async function save() {
           <ZSelect v-model="rule.color" :options="colors" class="w-24" :disabled="saving || !!rule.id" :aria-label="`第 ${i + 1} 个分组的颜色`" />
         </div>
         <div v-else class="flex flex-col gap-1">
-          <ZSelect v-if="!rule.id" v-model="rule.group_id" :options="groupOptions" filterable placeholder="选择 CPR 分组" :disabled="saving || !!view?.admin_error" :aria-label="`第 ${i + 1} 个规则的 CPR 分组`" />
+          <ZSelect v-if="!rule.id" v-model="rule.group_id" :options="groupOptions" filterable placeholder="选择 CPR 分组" :disabled="saving" :aria-label="`第 ${i + 1} 个规则的 CPR 分组`" />
           <span v-else class="flex items-center gap-2"><span class="inline-block size-3 rounded-full" :style="{ backgroundColor: rule.color }" aria-hidden="true" />{{ rule.name }}</span>
           <span class="text-cp-xs text-cp-text-tertiary">经 CPR 管理接口调整：只在账号判定变化时加入或移出这个账号，原有成员和账号的其他分组不动</span>
         </div>
@@ -174,8 +170,7 @@ async function save() {
         </p>
         <p v-else-if="!rule.id && kind(rule) === 'owned'" class="m-0 text-cp-xs text-cp-text-tertiary">保存后在 CPR 新建这个空分组，之后账号判定变化时加入；名称和颜色之后在 CPR 的分组管理里改</p>
       </div>
-      <p v-if="view?.admin_error && rules.some(r => r.group_id !== undefined)" class="m-0 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-warning-on-container">{{ view.admin_error }}</p>
-      <p v-else-if="cprError" class="m-0 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-warning-on-container">读不到 CPR 的分组：{{ cprError }}</p>
+      <p v-if="cprError" class="m-0 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-warning-on-container">读不到 CPR 的分组：{{ cprError }}</p>
       <div class="flex flex-wrap items-center gap-3">
         <ZButton size="small" :disabled="saving || rules.length >= (view?.max_rules ?? 8)" @click="add">
           <Plus :size="14" aria-hidden="true" /> 添加分组
@@ -185,7 +180,7 @@ async function save() {
       <p class="m-0 text-cp-xs text-cp-text-tertiary">
         只在账号的测票当前判定变化时调整，而且只动这个账号：新判定符合、旧判定不符合的组加进去，旧判定符合、新判定不符合的组移出去，其他分组和 CPR 里的手动改动都保留。
         保存设置、删除规则、关闭自动分组都不改成员；开启时以各账号当前判定为起点，不补之前的变化。不支持探测的账号不处理。
-        选 CPR 现有分组需要在插件设置里填写 CPR 地址和管理 API Key（该 Key 拥有全部管理权限，插件只用它读分组和改账号的分组）。
+        选 CPR 现有分组时，插件在 CPR 内部调用管理接口，只读分组和改账号的分组，不需要管理 API Key。
       </p>
       <div v-if="view?.status.changes?.length" class="flex flex-col gap-1">
         <span class="text-cp-xs font-medium text-cp-text-secondary">最近的调整</span>

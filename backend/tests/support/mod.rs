@@ -61,10 +61,10 @@ pub struct FakeHost {
     pub groups: BTreeMap<String, (String, BTreeSet<String>)>,
     /// CPR 里管理员已有的分组名
     pub taken_group_names: Vec<String>,
-    /// 假的 CPR 管理接口（`http://cpr.test`）：分组、账号所在分组、管理 API Key、收到的写入
+    /// 假的 CPR 管理接口（经 `host.http.dispatch`）：分组、账号所在分组、是否拒绝插件、收到的写入
     pub cpr_groups: Vec<Value>,
     pub cpr_account_groups: BTreeMap<String, BTreeSet<String>>,
-    pub cpr_admin_key: String,
+    pub cpr_admin_denied: bool,
     pub cpr_writes: Vec<Value>,
     pub cpr_admin_calls: Vec<String>,
     streams: HashMap<String, Vec<u8>>,
@@ -140,28 +140,23 @@ impl FakeHost {
 
     fn cpr_admin(&mut self, params: &Value, payload: &[u8]) -> (u16, Value) {
         let method = params["method"].as_str().unwrap().to_owned();
-        let url = params["url"].as_str().unwrap();
-        let path = url
-            .trim_start_matches("http://cpr.test")
-            .split('?')
-            .next()
-            .unwrap()
-            .to_owned();
+        let url = params["uri"].as_str().unwrap();
+        assert!(
+            url.starts_with("/api/admin/"),
+            "admin dispatch must use a relative host path: {url}"
+        );
+        let path = url.split('?').next().unwrap().to_owned();
         self.cpr_admin_calls.push(format!("{method} {path}"));
-        let key = params["headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|h| h[0] == "x-api-key")
-            .map(|h| {
-                let bytes: Vec<u8> = serde_json::from_value(h[1].clone()).unwrap();
-                String::from_utf8(bytes).unwrap()
-            });
-        if key.as_deref() != Some(self.cpr_admin_key.as_str()) || self.cpr_admin_key.is_empty() {
-            return (
-                401,
-                json!({"code":401,"message":"invalid admin api key","data":null}),
+        for h in params["headers"].as_array().unwrap() {
+            let name = h["name"].as_str().unwrap();
+            assert!(
+                !name.eq_ignore_ascii_case("x-api-key")
+                    && !name.eq_ignore_ascii_case("authorization"),
+                "dispatch must not carry credentials: {name}"
             );
+        }
+        if self.cpr_admin_denied {
+            return (403, json!({"code":403,"message":"forbidden","data":null}));
         }
         let ok = |data: Value| (200, json!({"code":200,"message":"ok","data":data}));
         match (method.as_str(), path.as_str()) {
@@ -383,19 +378,39 @@ impl FakeHost {
                 });
                 Ok((json!({"Ok":profile}), Vec::new()))
             }
-            "host.http.do_stream"
-                if params["url"]
-                    .as_str()
-                    .is_some_and(|u| u.starts_with("http://cpr.test/")) =>
-            {
-                let (status, body) = self.cpr_admin(params, payload);
-                let id = format!("cpr-stream-{}", self.cpr_admin_calls.len());
+            "host.http.dispatch" => {
+                let body = match params["body"]["kind"].as_str().unwrap() {
+                    "bytes" => payload.to_vec(),
+                    "empty" => Vec::new(),
+                    other => panic!("unexpected dispatch body kind {other}"),
+                };
+                let (status, reply) = self.cpr_admin(params, &body);
+                let id = format!("cpr-body-{}", self.cpr_admin_calls.len());
                 self.streams
-                    .insert(id.clone(), serde_json::to_vec(&body).unwrap());
+                    .insert(id.clone(), serde_json::to_vec(&reply).unwrap());
                 Ok((
-                    json!({"status":status,"http_version":"HTTP/1.1","headers":[],"stream":id,"trailers":[]}),
+                    json!({
+                        "status": status, "version": "HTTP/1.1", "headers": [],
+                        "body": {"kind": "handle", "handle": id},
+                        "response": null, "session": false,
+                    }),
                     Vec::new(),
                 ))
+            }
+            "host.http.body_read" => {
+                let id = params["handle"].as_str().unwrap();
+                let buf = self.streams.get_mut(id).expect("unknown body handle");
+                if buf.is_empty() {
+                    self.streams.remove(id);
+                    return Ok((json!({"eof": true, "trailers": null}), Vec::new()));
+                }
+                let n = buf.len().min(40);
+                let chunk: Vec<u8> = buf.drain(..n).collect();
+                Ok((json!({"eof": false, "trailers": null}), chunk))
+            }
+            "host.http.body_close" => {
+                self.streams.remove(params["handle"].as_str().unwrap());
+                Ok((json!({}), Vec::new()))
             }
             "host.http.do_stream" => {
                 self.seen_public_http.push(params.clone());

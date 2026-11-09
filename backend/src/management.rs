@@ -207,16 +207,13 @@ async fn groups_view(app: &App, host: &HostClient) -> Result<Value, ApiError> {
         "rules": config.rules,
         "max_rules": crate::groups::MAX_RULES,
         "status": app.groups.status(),
-        "admin_error": crate::admin::base_url(&app.runner.config).err(),
         "plans": plans,
     }))
 }
 
 /// 页面下拉框用的 CPR 现有分组；插件自己维护成员的标成不可选
 async fn cpr_groups(app: &App, host: &HostClient) -> Result<Value, ApiError> {
-    let admin = crate::admin::Admin::new(host, &app.runner.config)
-        .map_err(|reason| ApiError::new(409, "admin_not_configured", reason))?;
-    let groups = admin
+    let groups = crate::admin::Admin::new(host)
         .groups()
         .await
         .map_err(|reason| ApiError::new(502, "admin_failed", reason))?;
@@ -242,10 +239,8 @@ async fn save_groups(
         .iter()
         .any(|r| r.group_id.as_deref().is_some_and(|g| !g.is_empty()))
     {
-        let admin =
-            crate::admin::Admin::new(host, &app.runner.config).map_err(ApiError::invalid)?;
         Some(
-            admin
+            crate::admin::Admin::new(host)
                 .groups()
                 .await
                 .map_err(|reason| ApiError::new(502, "admin_failed", reason))?,

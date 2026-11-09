@@ -44,7 +44,7 @@
 - 分组可配置，最多 8 个：每个规则是一个目标分组和进组条件：判定（正常 / 疑似 / 降智 / 未判定，可多选）和账号类型（CPR 给的套餐，如 PLUS / PRO / TEAM，没有套餐算“未知”，可多选，不选表示全部），两个条件都符合才算符合。没配过时页面给出建议的“测票正常”（正常）和“测票异常”（疑似、降智），保存后才生效
 - 目标分组有两种：
   - **插件新建分组**：经插件 SDK 的分组接口，插件只能管理自己建的分组（按 resource_key）。保存时建好空分组；分组名和颜色只在创建时使用，之后在 CPR 的分组管理里改；与 CPR 已有分组重名会在规则下显示错误。管理员在 CPR 里删掉分组后，下次调整时重建
-  - **CPR 现有分组**：SDK 改不了管理员建的分组，所以经 CPR 管理员接口调整。需要在插件设置里填 `cprAdminUrl`（Docker 部署时插件和 CPR 在同一个容器，填 `http://127.0.0.1:8080`）并在敏感配置里填 `cprAdminApiKey`（CPR 设置里生成的管理 API Key，拥有全部管理权限）。插件只调用 `GET account-groups/options`、`GET accounts`、`POST accounts/batch-update`（只带 `accountIds` 和 `groupIds`），Key 只发给这个地址，不进历史、页面响应或错误信息；宿主不跟随重定向，3xx 也当失败。CPR 的 `groupIds` 是整体替换，插件读出这个账号现在的全部分组、只加上或去掉规则的分组再写回，读和写之间对同一账号的手动改动会被覆盖。插件自己维护的分组不能选；分组在 CPR 里删掉后规则下显示错误。这些是 CPR 网页用的管理接口，不是给插件的稳定合同，CPR 升级后可能需要适配
+  - **CPR 现有分组**：SDK 改不了管理员建的分组，所以经 CPR 管理员接口调整。v0.2.2 起经 `host.http.dispatch` 调宿主自己的路由（只传 `/api/admin/...` 相对路径），宿主给子请求注入插件身份，不需要设置、不需要管理 API Key，也不出本机网络。插件只调用 `GET account-groups/options`、`GET accounts`、`POST accounts/batch-update`（只带 `accountIds` 和 `groupIds`）。CPR 的 `groupIds` 是整体替换，插件读出这个账号现在的全部分组、只加上或去掉规则的分组再写回，读和写之间对同一账号的手动改动会被覆盖。插件自己维护的分组不能选；分组在 CPR 里删掉后规则下显示错误。这些是 CPR 网页用的管理接口，不是给插件的稳定合同，CPR 升级后可能需要适配
 - 刚测完的账号在下一轮维护（约 30 秒）调整；插件重启后核对一次所有账号，补上重启前已确认、还没来得及调整的变化。调整失败（宿主或管理接口暂时不可用）显示在规则下，下一轮重试；重名、分组被删这类配置问题不重试，那条规则跳过。页面列出最近 20 次调整
 - 不支持探测的账号（非 OpenAI OAuth）不处理。只调整分组成员：不发探测、不读账号凭据，不受“发出真实探测”开关影响
 
@@ -102,8 +102,12 @@ cargo test --manifest-path backend/Cargo.toml
 
 ```bash
 cargo install --locked --git https://github.com/zyycn/codex-proxy-rs.git --rev 47d30474af7c3e1fab433f2d4a70430fae548ff2 codex-proxy-plugin-cli --root .tools
+python3 -m venv .tools/zig && .tools/zig/bin/pip install ziglang==0.15.2 cargo-zigbuild==0.23.4
+export PATH="$PWD/.tools/zig/bin:$PATH"   # cargo-zigbuild 经这个环境的 python 找到 Zig
 bash scripts/package            # 默认本机平台；也可传 aarch64-unknown-linux-gnu 等
 ```
+
+Linux 安装包用 `cargo zigbuild --target <平台>.2.28` 构建，二进制最高只依赖 `GLIBC_2.28`：CPR 官方镜像是 Debian 12（glibc 2.36），在新系统上直接 `cargo build` 会链接更高的 GLIBC 符号，插件进程在握手前就退出。没装 cargo-zigbuild 时脚本退回 `cargo build` 并警告；发版流程设了 `REQUIRE_GLIBC_FLOOR=1`，缺工具或符号超过 2.28 就失败。
 
 在 CPR 的“插件管理”点安装，来源选 **GitHub**，填 `Milesians/cpr-turnstate`（标签留空取最新稳定版），按 CPR 服务器的平台选 `x86_64` 或 `aarch64` 的包，确认完整信任后安装；以后可以在插件详情里检查更新。也可以上传本地 `dist/` 里的 `.tar.gz`。
 

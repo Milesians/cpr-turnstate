@@ -440,15 +440,8 @@ impl Groups {
         let owned = self
             .apply_owned(host, &config, &transitions, &mut changes, &mut statuses)
             .await;
-        let existing = apply_existing(
-            runner,
-            host,
-            &config,
-            &transitions,
-            &mut changes,
-            &mut statuses,
-        )
-        .await;
+        let existing =
+            apply_existing(host, &config, &transitions, &mut changes, &mut statuses).await;
         let retry = owned.retry || existing.retry;
         if !retry {
             for t in &transitions {
@@ -511,10 +504,7 @@ impl Groups {
             }
         }
         if config.rules.iter().any(|r| r.group_id.is_some()) {
-            let groups = match Admin::new(host, &runner.config) {
-                Ok(admin) => admin.groups().await,
-                Err(reason) => Err(reason),
-            };
+            let groups = Admin::new(host).groups().await;
             for rule in config.rules.iter().filter(|r| r.group_id.is_some()) {
                 let status: &mut RuleStatus = statuses.entry(rule.id.clone()).or_default();
                 describe_existing(rule, groups.as_deref(), status);
@@ -642,7 +632,6 @@ fn describe_existing(
 /// 经 CPR 管理员接口调整现有分组：只读、只写判定变了的账号；每个账号读它现在的全部分组，
 /// 加上或去掉规则的分组后整体写回，账号的其他分组（包括手动加的）不变
 async fn apply_existing(
-    runner: &Runner,
     host: &HostClient,
     config: &GroupConfig,
     transitions: &[Transition],
@@ -666,14 +655,7 @@ async fn apply_existing(
         }
         Outcome { retry: true }
     };
-    let admin = match Admin::new(host, &runner.config) {
-        Ok(admin) => admin,
-        // 没配好是配置问题，不重试
-        Err(reason) => {
-            fail(statuses, &reason);
-            return Outcome { retry: false };
-        }
-    };
+    let admin = Admin::new(host);
     let groups = match admin.groups().await {
         Ok(groups) => groups,
         Err(reason) => return fail(statuses, &reason),

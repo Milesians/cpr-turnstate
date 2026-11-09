@@ -3,7 +3,7 @@
   "name": "cpr-turnstate",
   "displayName": "账号探测",
   "publisher": "milesians",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "ModelTrace 指纹与测票：主动探测 OpenAI OAuth 账号是否被降智",
   "license": "MIT",
   "author": "Milesians",
@@ -76,31 +76,11 @@
         "description": "ModelTrace 经 CPR 模型链发题时用的 Client Key 的 ID（CPR Client Key 列表里的 ID，不是 Key 本身）。这个 Key 要能访问所有要测的账号（建议不绑分组）；探测用量计入它，也受它的限额约束。不填则 ModelTrace 不可用",
         "maxLength": 128,
         "default": ""
-      },
-      "cprAdminUrl": {
-        "type": "string",
-        "title": "CPR 地址（自动分组调整现有分组用）",
-        "description": "插件连 CPR 管理接口的地址，如 http://127.0.0.1:8080；只在自动分组选了 CPR 现有分组时使用",
-        "maxLength": 512,
-        "default": ""
-      },
-      "cprAdminApiKey": {
-        "type": "string",
-        "title": "CPR 管理 API Key（敏感字段）",
-        "description": "CPR 设置里生成的管理 API Key，拥有全部管理权限；插件只用它读分组和改账号的分组。通过 CPR 独立敏感配置保存",
-        "maxLength": 512
-      }
-    },
-    "patternProperties": {
-      "^codexVersion$": {
-        "type": "string",
-        "deprecated": true,
-        "description": "仅兼容旧版设置；客户端身份始终读取 CPR，忽略此值"
       }
     },
     "additionalProperties": false
   },
-  "secretFields": ["telegramBotToken", "cprAdminApiKey"],
+  "secretFields": ["telegramBotToken"],
   "resources": {
     "web/index.html": "text/html",
     "web/app.js": "text/javascript",

@@ -14,11 +14,41 @@ case "$target" in
   *) echo "不支持的目标平台：$target" >&2; exit 1 ;;
 esac
 
+# Linux 二进制锁到 glibc 2.28：CPR 官方镜像是 Debian 12（glibc 2.36），新系统上直接 cargo build
+# 会链接更高的 GLIBC 符号，插件进程在握手前就退出。需要 Zig 和 cargo-zigbuild（见 README）
+glibc_floor="2.28"
+binary="backend/target/$target/release/cpr-account-probe"
+
 pnpm --dir frontend build
-cargo build --release --locked --target "$target" --manifest-path backend/Cargo.toml
+case "$target" in
+  *-linux-gnu)
+    if command -v cargo-zigbuild >/dev/null 2>&1; then
+      cargo zigbuild --release --locked --target "$target.$glibc_floor" --manifest-path backend/Cargo.toml
+    elif [ "${REQUIRE_GLIBC_FLOOR:-0}" = 1 ]; then
+      echo "没有 cargo-zigbuild，不能构建 glibc $glibc_floor 的发行包" >&2
+      exit 1
+    else
+      echo "警告：没有 cargo-zigbuild，用本机 glibc 构建，装到旧系统上可能启动失败" >&2
+      cargo build --release --locked --target "$target" --manifest-path backend/Cargo.toml
+    fi
+    if command -v objdump >/dev/null 2>&1; then
+      newest="$(objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+      if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$glibc_floor" | sort -V | tail -1)" != "$glibc_floor" ]; then
+        if [ "${REQUIRE_GLIBC_FLOOR:-0}" = 1 ]; then
+          echo "二进制依赖 GLIBC_$newest，高于 $glibc_floor" >&2
+          exit 1
+        fi
+        echo "警告：二进制依赖 GLIBC_$newest，高于 $glibc_floor" >&2
+      fi
+    fi
+    ;;
+  *)
+    cargo build --release --locked --target "$target" --manifest-path backend/Cargo.toml
+    ;;
+esac
 "$plugin_cli" package \
   --manifest plugin.json \
-  --binary "backend/target/$target/release/cpr-account-probe" \
+  --binary "$binary" \
   --target "$target" \
   --resource-map web=frontend/dist \
   --output-dir dist

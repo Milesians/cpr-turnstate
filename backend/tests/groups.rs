@@ -296,14 +296,12 @@ const BAD: &str = "grp_00000000000000000000000000000002";
 const OTHER: &str = "grp_00000000000000000000000000000003";
 
 fn admin_config() -> Value {
-    json!({"probeEnabled": true, "fingerprintSyncHours": 0,
-        "cprAdminUrl": "http://cpr.test/", "cprAdminApiKey": "admin-secret"})
+    json!({"probeEnabled": true, "fingerprintSyncHours": 0})
 }
 
 fn cpr_host() -> FakeHost {
     let mut host = FakeHost::new(&["acct_ok", "acct_bad", "acct_new", "acct_key"]);
     host.accounts[3]["authentication_kind"] = json!("apikey");
-    host.cpr_admin_key = "admin-secret".into();
     host.cpr_groups = vec![
         json!({"id": MAIN, "name": "主力", "color": "#22C55EFF", "enabled": true}),
         json!({"id": BAD, "name": "隔离", "color": "#EF4444FF", "enabled": true}),
@@ -376,9 +374,7 @@ async fn existing_cpr_groups_change_only_for_accounts_whose_verdict_changed() {
     assert_eq!(view["status"]["changes"][0]["added"], json!(["主力"]));
     assert_eq!(view["status"]["changes"][0]["removed"], json!(["隔离"]));
 
-    // Key 不进私有状态和响应；只调用这三个管理路由
-    let stored = serde_json::to_string(&host.state.values().collect::<Vec<_>>()).unwrap();
-    assert!(!stored.contains("admin-secret") && !view.to_string().contains("admin-secret"));
+    // 只调用这三个管理路由
     assert!(
         host.cpr_admin_calls
             .iter()
@@ -396,7 +392,7 @@ async fn a_failed_admin_write_is_retried_next_round() {
     let mut peer = Peer::start(admin_config()).await;
     save(&mut peer, &mut host, existing_rules()).await;
     confirm(&mut peer, &mut host, "acct_bad", "ok").await;
-    let key = std::mem::replace(&mut host.cpr_admin_key, "rotated".into());
+    host.cpr_admin_denied = true;
     peer.reconcile(&mut host).await;
     assert_eq!(cpr(&host, "acct_bad"), set(&[BAD, OTHER]));
     assert_eq!(
@@ -406,43 +402,30 @@ async fn a_failed_admin_write_is_retried_next_round() {
     );
     let (_, view) = peer.api("GET", "api/groups", "", None, &mut host).await;
     assert!(
-        view["status"]["rules"].to_string().contains("无效"),
+        view["status"]["rules"].to_string().contains("没有权限"),
         "{view}"
     );
-    host.cpr_admin_key = key;
+    host.cpr_admin_denied = false;
     peer.reconcile(&mut host).await;
     assert_eq!(cpr(&host, "acct_bad"), set(&[MAIN, OTHER]));
     assert_eq!(grouped_level(&host, "acct_bad"), "ok");
 }
 
 #[tokio::test]
-async fn existing_group_rules_need_a_working_admin_api() {
-    // 没配地址和 Key
+async fn existing_group_rules_need_the_host_to_allow_admin_calls() {
+    // 不用任何设置就能读 CPR 分组
     let mut host = cpr_host();
     let mut peer = Peer::start(enabled()).await;
-    let (status, body) = save(&mut peer, &mut host, existing_rules()).await;
-    assert_eq!(status, 400, "{body}");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("管理 API Key")
-    );
-    assert_eq!(
-        peer.api("GET", "api/groups/cpr", "", None, &mut host)
-            .await
-            .0,
-        409
-    );
-    assert!(host.cpr_admin_calls.is_empty());
+    let (status, body) = peer.api("GET", "api/groups/cpr", "", None, &mut host).await;
+    assert_eq!(status, 200, "{body}");
 
-    // Key 不对：错误里不带 Key
-    let mut host = cpr_host();
-    host.cpr_admin_key = "another".into();
-    let mut peer = Peer::start(admin_config()).await;
+    // 宿主拒绝插件调用管理接口：读分组和保存都报出来
+    host.cpr_admin_denied = true;
     let (status, body) = peer.api("GET", "api/groups/cpr", "", None, &mut host).await;
     assert_eq!(status, 502, "{body}");
-    assert!(body.to_string().contains("无效") && !body.to_string().contains("admin-secret"));
+    assert!(body.to_string().contains("没有权限"), "{body}");
+    let (status, body) = save(&mut peer, &mut host, existing_rules()).await;
+    assert_eq!(status, 502, "{body}");
 }
 
 #[tokio::test]

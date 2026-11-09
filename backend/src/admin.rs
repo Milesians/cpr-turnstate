@@ -1,20 +1,23 @@
 //! CPR 管理员接口：只用来读分组、读账号所在的分组，以及改账号的分组
 //!
 //! 插件 SDK 只能管理插件自己建的分组；要调整管理员建的现有分组，只能经 CPR 的管理员接口
-//! （用户 2026-11-02 选择）。用部署级管理 API Key（`x-api-key`），只发给配置的 CPR 地址，
-//! 宿主客户端不跟随重定向，3xx 也当失败。只调用下面这几个路由；`accounts/batch-update`
-//! 只带 `accountIds` 和 `groupIds`。错误信息不带 Key 和地址。
+//! （用户 2026-11-02 选择）。经 `host.http.dispatch` 发给宿主自己的路由：只传相对路径，
+//! 宿主给子请求注入插件身份，不需要管理 API Key，也不出本机网络。只调用下面这几个路由；
+//! `accounts/batch-update` 只带 `accountIds` 和 `groupIds`。
 
-use gateway_plugin_sdk::{call::host::HttpRequest, client::HostClient};
+use gateway_plugin_sdk::{
+    call::middleware::{MiddlewareHeader, http::Version},
+    client::{HostClient, HttpBody, HttpFrame, HttpRequest},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use crate::config::Config;
 use crate::verdict::one_line;
 
 const PAGE_SIZE: u32 = 200;
 const MAX_PAGES: u32 = 100;
 const MAX_BODY: usize = 8 * 1024 * 1024;
+const TIMEOUT_MS: u64 = 20_000;
 /// 宿主上限是 1000，留余量
 pub const BATCH: usize = 500;
 
@@ -69,52 +72,14 @@ struct Envelope {
     data: Value,
 }
 
-/// 配好了地址和 Key 时返回规范化的地址（去掉末尾的 `/`）
-///
-/// # Errors
-/// 没配或配得不对时返回给页面看的原因
-pub fn base_url(config: &Config) -> Result<String, &'static str> {
-    let url = config.cpr_admin_url.trim().trim_end_matches('/');
-    let key = config.cpr_admin_api_key.trim();
-    if url.is_empty() || key.is_empty() {
-        return Err(
-            "在插件设置里填写 CPR 地址，并在敏感配置里填写 CPR 管理 API Key 后才能调整现有分组",
-        );
-    }
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"));
-    if rest.is_none_or(|r| {
-        r.is_empty() || r.contains(['?', '#', '@']) || r.chars().any(char::is_whitespace)
-    }) || url.len() > 512
-    {
-        return Err("CPR 地址格式不对，应为 http(s)://主机[:端口]");
-    }
-    if key.len() > 512 || key.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("CPR 管理 API Key 格式不对");
-    }
-    Ok(url.to_owned())
-}
-
 pub struct Admin<'a> {
     host: &'a HostClient,
-    base: String,
-    key: String,
 }
 
 impl<'a> Admin<'a> {
-    /// # Errors
-    /// 没配好时返回原因
-    pub fn new(host: &'a HostClient, config: &Config) -> Result<Self, String> {
-        Ok(Self {
-            host,
-            base: base_url(config)?,
-            key: config.cpr_admin_api_key.trim().to_owned(),
-        })
-    }
-
-    fn redact(&self, s: &str) -> String {
-        one_line(&s.replace(&self.key, "***").replace(&self.base, "CPR"), 200)
+    #[must_use]
+    pub const fn new(host: &'a HostClient) -> Self {
+        Self { host }
     }
 
     async fn call<T: DeserializeOwned>(
@@ -124,48 +89,58 @@ impl<'a> Admin<'a> {
         query: &str,
         body: Option<Value>,
     ) -> Result<T, String> {
-        let mut headers = vec![
-            ("x-api-key".to_owned(), self.key.as_bytes().to_vec()),
-            ("Accept".to_owned(), b"application/json".to_vec()),
-        ];
-        let payload = match body {
+        let mut headers = vec![MiddlewareHeader {
+            name: "accept".to_owned(),
+            value: b"application/json".to_vec(),
+        }];
+        let body = match body {
             Some(body) => {
-                headers.push(("Content-Type".to_owned(), b"application/json".to_vec()));
-                serde_json::to_vec(&body).map_err(|_| "请求编码失败".to_owned())?
+                headers.push(MiddlewareHeader {
+                    name: "content-type".to_owned(),
+                    value: b"application/json".to_vec(),
+                });
+                HttpBody::from_bytes(
+                    serde_json::to_vec(&body).map_err(|_| "请求编码失败".to_owned())?,
+                )
             }
-            None => Vec::new(),
+            None => HttpBody::empty(),
         };
-        let url = if query.is_empty() {
-            format!("{}{path}", self.base)
+        let uri = if query.is_empty() {
+            path.to_owned()
         } else {
-            format!("{}{path}?{query}", self.base)
+            format!("{path}?{query}")
         };
-        let response = self
+        let mut response = self
             .host
-            .http(
-                HttpRequest {
-                    method: method.to_owned(),
-                    url,
-                    headers,
-                },
-                payload,
-            )
+            .dispatch_http(HttpRequest {
+                settings: Value::Null,
+                method: method.to_owned(),
+                uri,
+                version: Version::Http11,
+                headers,
+                timeout_ms: Some(TIMEOUT_MS),
+                body,
+            })
             .await
-            .map_err(|_| "连不上 CPR 管理接口，请检查插件设置里的 CPR 地址".to_owned())?;
+            .map_err(|_| "调不通 CPR 管理接口，请确认 CPR 版本支持插件调用管理接口".to_owned())?;
         let status = response.status;
-        let bytes = response
-            .body
-            .collect(MAX_BODY)
-            .await
-            .map_err(|_| "读取 CPR 管理接口的响应失败".to_owned())?;
-        match status {
-            401 | 403 => return Err("CPR 管理 API Key 无效或没有权限".into()),
-            300..=399 => {
-                return Err(format!(
-                    "CPR 管理接口返回重定向（HTTP {status}），请填写 CPR 的实际地址"
-                ));
+        let mut bytes = Vec::new();
+        loop {
+            match response.body.read().await {
+                Ok(Some(HttpFrame::Data(chunk))) => {
+                    if bytes.len() + chunk.len() > MAX_BODY {
+                        let _ = response.body.close().await;
+                        return Err("CPR 管理接口的响应太大".into());
+                    }
+                    bytes.extend(chunk);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => return Err("读取 CPR 管理接口的响应失败".into()),
             }
-            _ => {}
+        }
+        if matches!(status, 401 | 403) {
+            return Err("CPR 拒绝了插件调用管理接口（没有权限）".into());
         }
         let envelope: Envelope = serde_json::from_slice(&bytes)
             .map_err(|_| format!("CPR 管理接口返回了无效响应（HTTP {status}）"))?;
@@ -173,7 +148,7 @@ impl<'a> Admin<'a> {
         if !(200..300).contains(&status) || envelope.code.as_u64() != Some(200) {
             return Err(format!(
                 "CPR 管理接口拒绝了请求（HTTP {status}）：{}",
-                self.redact(&envelope.message)
+                one_line(&envelope.message, 200)
             ));
         }
         serde_json::from_value(envelope.data)

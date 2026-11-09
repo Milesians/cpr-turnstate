@@ -60,9 +60,16 @@ jobs:
         with:
           workspaces: backend -> target
       - run: pnpm --dir frontend install --frozen-lockfile
+      - name: Install Zig and cargo-zigbuild (glibc 2.28 floor)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install --disable-pip-version-check ziglang==0.15.2 cargo-zigbuild==0.23.4
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
       - name: Install pinned package tool
         run: cargo install --locked --git https://github.com/zyycn/codex-proxy-rs.git --rev 47d30474af7c3e1fab433f2d4a70430fae548ff2 codex-proxy-plugin-cli --root .tools
       - name: Build installable package
+        env:
+          REQUIRE_GLIBC_FLOOR: '1'
         run: bash scripts/package "${{ matrix.target }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
